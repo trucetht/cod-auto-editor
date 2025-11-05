@@ -1,0 +1,119 @@
+enable_overlays: false
+
+# Filler / speech disfluencies
+filler_words: [um, umm, uh, uhh, uhm, like, "you know", kinda, "sort of"]
+filler_pre_pad_sec: 0.40
+filler_post_pad_sec: 0.35
+filler_merge_gap_sec: 0.40
+
+# Downtime rules
+downtime_short_threshold_sec: 10.0
+speed_ramp_factor: 2.0
+min_downtime_sec: 3.0
+transition_ms: 180
+
+# Silence cutting (pure VAD-by-words)
+min_silence_cut_sec: 3.0         # cut any word gap >= this
+silence_pre_pad_sec: 0.00        # small pad before the silence window (optional)
+silence_post_pad_sec: 0.00       # small pad after the silence window (optional)
+
+# Analysis
+analysis_fps: 5
+motion_threshold: auto
+audio_threshold: auto
+
+# Whisper (Torch)
+whisper_model: large-v3
+use_vad: true          # (OpenAI whisper doesn't expose VAD; kept for future compatibility)
+word_timestamps: true  # we enable timestamps in code
+
+# Output
+target_fps: 60
+preset: "medium"
+
+# HDR-preserve export (FFmpeg, 10-bit HEVC HLG)
+hdr_preserve: true
+render_profile: hevc10_hlg
+pix_fmt_10bit: "p010le"
+color_primaries: "bt2020"
+colorspace: "bt2020nc"
+color_trc: "arib-std-b67"  # use "smpte2084" if your source is HDR10/PQ
+video_tag: "hvc1"
+bitrate: "60M"
+maxrate: "120M"
+bufsize: "240M"
+
+# Audio
+audio_codec: "aac"
+audio_bitrate: "320k"
+
+# Force Torch/MPS for ASR segments; skip word alignment on GPU
+use_stable_ts: false            # skip stable-ts entirely (avoids MPS sparse issue)
+whisper_model: large-v3         # or medium.en for speed
+whisper_device_order: [metal, cuda, cpu]   # try Metal first
+whisper_compute_types:
+  metal: float16
+  cuda: float16
+  cpu: int8_float32
+decoding_fast: true   
+force_torch_device: mps         # 'mps' | 'cpu'
+torch_word_timestamps: false    # IMPORTANT: keep false on MPS
+
+# semantic dedupe (near-duplicate takes)
+enable_semantic_dedupe: true
+dedupe_similarity: 0.82
+dedupe_window_sec: 180
+dedupe_pre_pad_sec: 0.25
+dedupe_post_pad_sec: 0.25
+silence_cut_min_gap_sec: 3.0
+silence_pre_pad_sec: 0.05
+silence_post_pad_sec: 0.05
+utterance_max_gap_sec: 1.2
+
+# Intro anchor (remove all takes before the last repeated intro at the start)
+# make matching robust and sentence-aligned
+intro_anchor_window_sec: 70
+intro_anchor_min_repeat: 2
+intro_anchor_similarity: 0.84
+intro_anchor_token_gap_sec: 3.0   # allow up to 3s between "welcome" and "back" inside an utterance
+intro_anchor_phrases: ["welcome back", "welcome back guys", "all right welcome back"]
+
+
+gunshots_only_mode: true          # set true to keep only shooting
+gun_pre_buffer_sec: 0.30
+gun_post_buffer_sec: 5.0
+gun_merge_gap_sec: 0.35           # merge shots closer than this
+gun_band_low_hz: 2000
+gun_band_high_hz: 9000
+gun_min_snr_db: 8.0               # high-band energy vs low-band
+gun_min_peak_norm: 0.15           # 0..1 peak mag threshold
+gun_min_frames_in_burst: 2        # at least a couple frames
+
+# --- Hitmarker / gunshot filter ---
+enable_hitmarker_filter: true         # turn on to keep only detected events
+hit_probe_prefix: "bo7_probe"         # output prefix for CSV/TXT/VTT files
+hit_sr: 24000
+hit_n_fft: 1024
+hit_hop: 240
+hit_high_lo: 3000.0
+hit_high_hi: 11000.0
+hit_low_lo: 80.0
+hit_low_hi: 1800.0
+hit_high_quantile: 0.98               # global high-band quantile
+hit_snr_thresh: 6.0                   # global SNR (dB)
+hit_adaptive: true                    # rolling thresholds
+hit_win_sec: 1.5
+hit_local_high_q: 0.90
+hit_local_snr_q: 0.90
+hit_alpha_high: 1.0
+hit_alpha_snr: 1.0
+hit_use_flux: true
+hit_flux_quantile: 0.98
+hit_flux_relax_high_q: 0.90
+hit_min_event_ms: 25.0
+hit_refractory_ms: 60.0
+hit_merge_gap_sec: 0.18
+hit_pre_buffer_sec: .75              # keep X sec before peak/window
+hit_post_buffer_sec: .75           # keep Y sec after (your “5s buffer”)
+hit_chain_gap_sec: 3.5   # extend the current keep window if the next event starts ≤ this after the last event's end
+

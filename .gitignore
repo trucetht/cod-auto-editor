@@ -1,0 +1,53 @@
+# === Project folders to ignore ===
+/input/
+/output/
+/output/**
+
+# Keep the directories in the repo structure (optional)
+/input/.gitkeep
+/output/.gitkeep
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.egg
+.eggs/
+.build/
+dist/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+*.env
+*.env.*
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs & cache
+*.log
+logs/
+.cache/
+.mypy_cache/
+.pytype/
+.pytest_cache/
+
+# MoviePy temp / FFMPEG scratch
+TEMP_MPY_*
+temp_audio_*.mp3
+temp_*.mp4
+*.temp
+
+# Node (if any UI bits end up here)
+node_modules/

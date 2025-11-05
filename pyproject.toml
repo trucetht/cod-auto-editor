@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cod-auto-editor"
+version = "0.1.0"
+description = "Call of Duty auto editor: intro anchor, filler/silence, semantic dedupe, hitmarkers, HDR/SDR renderers"
+authors = [{ name = "You" }]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "moviepy",
+  "opencv-python",
+  "numpy",
+  "PyYAML",
+  "torch",
+  "faster-whisper",
+  "psycopg2-binary",
+  "sentence-transformers; python_version >= '3.9'",
+  "stable-ts; python_version >= '3.9'",
+  "PyQt5>=5.15.9,<6",
+]
+
+[project.scripts]
+cod-auto-editor = "cod_auto_editor.cli:main"
+cod-auto-editor-gui = "cod_auto_editor.gui_qt:qt_main"
+
+[tool.setuptools]
+# Only package our library, ignore folders like "input/" and "output/"
+packages = ["cod_auto_editor"]
+
+[tool.setuptools.package-data]
+# (Add patterns if you later ship icons, qss, etc.)
+cod_auto_editor = []
