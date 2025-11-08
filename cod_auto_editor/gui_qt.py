@@ -92,11 +92,11 @@ class CheckStyle(QtWidgets.QProxyStyle):
                 p.moveTo(r.left() + r.width() * 0.22, r.center().y())
                 p.lineTo(r.left() + r.width() * 0.45, r.bottom() - r.height() * 0.22)
                 p.lineTo(r.right() - r.width() * 0.20, r.top() + r.height() * 0.28)
-                painter.setPen(QtGui.QPen(col_check, 2.2, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
+                painter.setPen(QtGui.QPen(QtGui.QColor("#000000"), 2.2, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
                 painter.drawPath(p)
 
             painter.restore()
-            return
+            return None  # explicit
 
         # Fallback to default for everything else
         return super().drawPrimitive(element, option, painter, widget)
@@ -178,26 +178,27 @@ class FinalizeWorker(QtCore.QObject):
 class ClipPlayer(QtCore.QObject):
     frameReady = QtCore.pyqtSignal(QtGui.QImage, float)
     finished = QtCore.pyqtSignal()
+    error = QtCore.pyqtSignal(str)
 
     def __init__(self, video_path: str, start_t: float, end_t: float, fps_hint: int = 30):
         super().__init__()
         self.video_path = video_path
         self.start_t = float(start_t)
         self.end_t = float(end_t)
-        self._stop = False
+        self._stop_ev = threading.Event()  # thread-safe stop flag
         self.fps_hint = max(1, int(fps_hint))
 
     @QtCore.pyqtSlot()
     def play(self):
+        cap = cv2.VideoCapture(self.video_path)
         try:
-            cap = cv2.VideoCapture(self.video_path)
             if not cap.isOpened():
-                self.finished.emit()
+                self.error.emit(f"[Player] Could not open video: {self.video_path}")
                 return
             cap.set(cv2.CAP_PROP_POS_MSEC, self.start_t * 1000.0)
             delay_ms = int(1000 / self.fps_hint)
 
-            while not self._stop:
+            while not self._stop_ev.is_set():
                 ok, frame = cap.read()
                 if not ok:
                     break
@@ -210,12 +211,19 @@ class ClipPlayer(QtCore.QObject):
                 qimg = QtGui.QImage(rgb.data, w, h, ch * w, QtGui.QImage.Format_RGB888).copy()
                 self.frameReady.emit(qimg, t)
                 QtCore.QThread.msleep(delay_ms)
-            cap.release()
-        except Exception:
-            pass
-        self.finished.emit()
+        except Exception as e:
+            import traceback
+            self.error.emit(f"[Player] {e}\n\n{traceback.format_exc()}")
+        finally:
+            try:
+                cap.release()
+            except Exception:
+                # Best-effort release; ignore secondary errors
+                pass
+            self.finished.emit()
 
-    def stop(self): self._stop = True
+    def stop(self):
+        self._stop_ev.set()
 
 # -------------------- GUI --------------------
 
@@ -488,7 +496,8 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             s = float(self.table.item(r, 1).text())
             e = float(self.table.item(r, 2).text())
-        except Exception:
+        except ValueError:
+            # Skip if cells are malformed/empty
             return
         self._stop_player_if_any()
         self._player_thread = QtCore.QThread(self)
@@ -496,15 +505,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._player.moveToThread(self._player_thread)
         self._player_thread.started.connect(self._player.play)
         self._player.frameReady.connect(self._on_frame)
+        self._player.error.connect(self._append_log)          # <-- log player errors
         self._player.finished.connect(self._player_thread.quit)
         self._player_thread.finished.connect(self._cleanup_player)
         self._player_thread.start()
 
-    def _on_stop(self): self._stop_player_if_any()
+    def _on_stop(self):
+        self._stop_player_if_any()
 
     def _stop_player_if_any(self):
         if self._player:
             self._player.stop()
+        # cleanup happens when the thread finishes
 
     def _cleanup_player(self):
         if self._player: self._player.deleteLater()
@@ -533,10 +545,14 @@ class MainWindow(QtWidgets.QMainWindow):
         for r in range(self.table.rowCount()):
             if self.table.item(r, 0).checkState() == QtCore.Qt.Checked:
                 try:
-                    s = float(self.table.item(r, 1).text()); e = float(self.table.item(r, 2).text())
-                    if e > s: approved.append((s, e))
-                except Exception:
-                    pass
+                    s = float(self.table.item(r, 1).text())
+                    e = float(self.table.item(r, 2).text())
+                    if e > s:
+                        approved.append((s, e))
+                except ValueError:
+                    # Skip rows with invalid float conversion (e.g., empty or malformed cells)
+                    continue
+
         if not approved:
             QtWidgets.QMessageBox.information(self, "No clips selected", "Select at least one clip to render."); return
 

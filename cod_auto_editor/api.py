@@ -17,7 +17,7 @@ from .analysis import compute_motion_array, compute_audio_rms_array, detect_down
 from .hitmarker import detect_hitmarker_events, build_chained_keep_windows_from_events
 from .edit import build_edit_pieces, build_keep_only_pieces
 from .renderers import render_with_moviepy, render_with_ffmpeg_hdr
-from .utils import save_transcript_txt, save_intervals_txt, out_video_dir, details_path
+from .utils import save_transcript_txt, save_intervals_txt, details_path
 from moviepy.editor import VideoFileClip
 
 def _p(cb: Optional[Callable[[float], None]], x: float):
@@ -83,7 +83,7 @@ def run_pipeline(
     events = []
     if bool(cfg.get("enable_hitmarker_filter", False)):
         _l(log, "[Hitmarker] Detecting hit/gun events…")
-        events, spf = detect_hitmarker_events(input_path, cfg)
+        events, _ = detect_hitmarker_events(input_path, cfg)
         if events:
             pre_buf = float(cfg.get("hit_pre_buffer_sec", 0.30))
             post_buf = float(cfg.get("hit_post_buffer_sec", 5.00))
@@ -162,14 +162,17 @@ def run_pipeline(
     try:
         _l(log, "[Analysis] Computing motion/audio metrics…")
         t_motion, motion_norm, _ = compute_motion_array(
-            input_path, fps_sample=int(cfg.get("analysis_fps", 5)), cb_frame=frame_preview
+            input_path,
+            fps_sample=int(cfg.get("analysis_fps", 5)),
+            cb_frame=frame_preview,
+            cb_error=log,  # surface preview-callback errors to UI log
         )
         with VideoFileClip(input_path) as clip2:
             t_audio, audio_norm = compute_audio_rms_array(clip2, step=0.5)
         downtime_all = detect_downtime(t_audio, audio_norm, t_motion, motion_norm, cfg)
         short_thresh = float(cfg.get("downtime_short_threshold_sec", 10.0))
-        downtime_short = [(s,e) for (s,e) in downtime_all if (e - s) <= short_thresh]
-        downtime_long  = [(s,e) for (s,e) in downtime_all if (e - s)  > short_thresh]
+        downtime_short = [(s, e) for (s, e) in downtime_all if (e - s) <= short_thresh]
+        downtime_long  = [(s, e) for (s, e) in downtime_all if (e - s)  > short_thresh]
         save_intervals_txt(details_path(cfg, "downtime_short.txt"), downtime_short, "Downtime short (speed ramp)")
         save_intervals_txt(details_path(cfg, "downtime_long.txt"),  downtime_long,  "Downtime long (jump cut)")
         _l(log, f"[Downtime] short={len(downtime_short)} long={len(downtime_long)}")
@@ -197,6 +200,11 @@ def run_pipeline(
             candidates = [(s, e) for (s, e, lab) in pieces if lab != "cut"]
         _l(log, f"[Review] Prepared {len(candidates)} candidate clips.")
         _p(progress, 0.80)
+
+        # NEW: respect cancellation just before returning review candidates
+        if cancelled():
+            raise RuntimeError("Cancelled")
+
         return {
             "review_mode": True,
             "input_path": input_path,

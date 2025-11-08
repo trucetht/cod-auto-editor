@@ -2,13 +2,18 @@
 from typing import List, Tuple, Optional, Callable
 import numpy as np
 import cv2
+import logging
+import traceback
 from moviepy.editor import VideoFileClip
 from .intervals import merge_intervals, clamp
+
+logger = logging.getLogger(__name__)
 
 def compute_motion_array(
     video_path: str,
     fps_sample: int = 5,
-    cb_frame: Optional[Callable[[np.ndarray, float], None]] = None
+    cb_frame: Optional[Callable[[np.ndarray, float], None]] = None,
+    cb_error: Optional[Callable[[str], None]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     """
     Returns (times_sec, motion_norm, sample_fps)
@@ -16,6 +21,10 @@ def compute_motion_array(
 
     If cb_frame is provided, it's called periodically as:
         cb_frame(frame_bgr, t_sec)
+
+    If cb_error is provided, preview-callback exceptions are reported as:
+        cb_error(str_with_traceback)
+    Otherwise a module-level warning is logged.
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -57,8 +66,16 @@ def compute_motion_array(
             if cb_frame and (idx % preview_stride == 0):
                 try:
                     cb_frame(frame, t)
-                except Exception:
-                    pass
+                except Exception as e:
+                    msg = f"[compute_motion_array.preview] {e}\n{traceback.format_exc()}"
+                    if cb_error is not None:
+                        try:
+                            cb_error(msg)
+                        except Exception:
+                            # Avoid cascading failures from the error callback itself
+                            logger.warning(msg)
+                    else:
+                        logger.warning(msg)
         idx += 1
 
     cap.release()
