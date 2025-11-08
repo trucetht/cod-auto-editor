@@ -1,7 +1,7 @@
 # cod_auto_editor/api.py
 from __future__ import annotations
 import os
-from typing import Callable, Optional, Tuple, List
+from typing import Callable, Optional, Tuple, List, Sequence
 
 from .db import pg_connect_from_env, load_triggers
 from .asr import transcribe_audio
@@ -17,7 +17,7 @@ from .analysis import compute_motion_array, compute_audio_rms_array, detect_down
 from .hitmarker import detect_hitmarker_events, build_chained_keep_windows_from_events
 from .edit import build_edit_pieces, build_keep_only_pieces
 from .renderers import render_with_moviepy, render_with_ffmpeg_hdr
-from .utils import save_transcript_txt, save_intervals_txt
+from .utils import save_transcript_txt, save_intervals_txt, out_video_dir, details_path
 from moviepy.editor import VideoFileClip
 
 def _p(cb: Optional[Callable[[float], None]], x: float):
@@ -40,7 +40,13 @@ def run_pipeline(
     log: Optional[Callable[[str], None]] = None,
     progress: Optional[Callable[[float], None]] = None,
     is_cancelled: Optional[Callable[[], bool]] = None,
+    frame_preview: Optional[Callable[[object, float], None]] = None,
+    review_only: bool = False,
 ) -> dict:
+    """
+    Main pipeline. If review_only=True, returns candidate keep windows and DOES NOT render.
+    frame_preview(frame_bgr, t_sec) will be called periodically during early analysis.
+    """
     import yaml
     if not os.path.isfile(input_path):
         raise FileNotFoundError(f"Input not found: {input_path}")
@@ -60,7 +66,7 @@ def run_pipeline(
     _l(log, "[Init] Starting pipeline…")
     _p(progress, 0.02)
 
-    # Optional overlays
+    # Optional overlays (only for final render path)
     triggers, assets = [], {}
     if cfg.get("enable_overlays", False) and not cfg.get("hdr_preserve", False):
         try:
@@ -96,7 +102,7 @@ def run_pipeline(
     # Transcribe original
     _l(log, "[ASR] Transcribing original…")
     segments_orig = transcribe_audio(input_path, cfg, purpose="original")
-    save_transcript_txt("output/details/transcript_original.txt", segments_orig, "Original transcript")
+    save_transcript_txt(details_path(cfg, "transcript_original.txt"), segments_orig, "Original transcript")
     _p(progress, 0.18)
     if cancelled(): raise RuntimeError("Cancelled")
 
@@ -106,7 +112,7 @@ def run_pipeline(
 
     # Filler
     filler_cuts = detect_filler_segments(segments_orig, cfg, duration)
-    save_intervals_txt("output/details/filler_cuts.txt", filler_cuts, "Filler word cut windows")
+    save_intervals_txt(details_path(cfg, "filler_cuts.txt"), filler_cuts, "Filler word cut windows")
     _l(log, f"[Filler] windows={len(filler_cuts)}")
 
     # Silence
@@ -114,7 +120,7 @@ def run_pipeline(
     sil_pre  = float(cfg.get("silence_pre_pad_sec", 0.05))
     sil_post = float(cfg.get("silence_post_pad_sec", 0.05))
     silence_cuts = detect_silence_cuts_from_words(segments_orig, duration, sil_min, sil_pre, sil_post)
-    save_intervals_txt("output/details/silence_cuts.txt", silence_cuts, "Silence (no-speech) cut windows")
+    save_intervals_txt(details_path(cfg, "silence_cuts.txt"), silence_cuts, "Silence (no-speech) cut windows")
     _l(log, f"[Silence] (≥{sil_min}s) windows={len(silence_cuts)}")
     _p(progress, 0.28)
     if cancelled(): raise RuntimeError("Cancelled")
@@ -129,7 +135,7 @@ def run_pipeline(
     intro_cuts = []
     if head_cut:
         intro_cuts.append(head_cut)
-        save_intervals_txt("output/details/intro_anchor.txt", intro_cuts, "Intro anchor cut(s)")
+        save_intervals_txt(details_path(cfg, "intro_anchor.txt"), intro_cuts, "Intro anchor cut(s)")
     _p(progress, 0.34)
     if cancelled(): raise RuntimeError("Cancelled")
 
@@ -146,24 +152,26 @@ def run_pipeline(
         semantic_dupe_cuts = detect_semantic_duplicates(
             utterances, duration, sem_thresh, sem_window, sem_pre_pad, sem_post_pad
         )
-    save_intervals_txt("output/details/semantic_dupes.txt", semantic_dupe_cuts, "Semantic duplicate cut windows")
-    log_semantic_dupes("output/details/semantic_dupes_detail.txt", utterances, semantic_dupe_cuts)
+    save_intervals_txt(details_path(cfg, "semantic_dupes.txt"), semantic_dupe_cuts, "Semantic duplicate cut windows")
+    log_semantic_dupes(details_path(cfg, "semantic_dupes_detail.txt"), utterances, semantic_dupe_cuts)
     _p(progress, 0.42)
     if cancelled(): raise RuntimeError("Cancelled")
 
-    # Motion/audio downtime (best-effort)
+    # Motion/audio downtime (best-effort) + live preview from frame scan
     downtime_short = []; downtime_long = []
     try:
         _l(log, "[Analysis] Computing motion/audio metrics…")
-        t_motion, motion_norm, _ = compute_motion_array(input_path, fps_sample=int(cfg.get("analysis_fps", 5)))
+        t_motion, motion_norm, _ = compute_motion_array(
+            input_path, fps_sample=int(cfg.get("analysis_fps", 5)), cb_frame=frame_preview
+        )
         with VideoFileClip(input_path) as clip2:
             t_audio, audio_norm = compute_audio_rms_array(clip2, step=0.5)
         downtime_all = detect_downtime(t_audio, audio_norm, t_motion, motion_norm, cfg)
         short_thresh = float(cfg.get("downtime_short_threshold_sec", 10.0))
         downtime_short = [(s,e) for (s,e) in downtime_all if (e - s) <= short_thresh]
         downtime_long  = [(s,e) for (s,e) in downtime_all if (e - s)  > short_thresh]
-        save_intervals_txt("output/details/downtime_short.txt", downtime_short, "Downtime short (speed ramp)")
-        save_intervals_txt("output/details/downtime_long.txt",  downtime_long,  "Downtime long (jump cut)")
+        save_intervals_txt(details_path(cfg, "downtime_short.txt"), downtime_short, "Downtime short (speed ramp)")
+        save_intervals_txt(details_path(cfg, "downtime_long.txt"),  downtime_long,  "Downtime long (jump cut)")
         _l(log, f"[Downtime] short={len(downtime_short)} long={len(downtime_long)}")
     except Exception as e:
         _l(log, f"[Analysis] Skipping downtime: {e}")
@@ -180,7 +188,24 @@ def run_pipeline(
         )
         pieces = build_edit_pieces(duration, hard_first_pass, silence_cuts, downtime_short, downtime_long)
 
-    # Render
+    # Derive candidate keep windows for review mode
+    if review_only:
+        if keep_from_hits:
+            candidates = keep_from_hits[:]  # gunfight-focused
+        else:
+            # any non-cut piece is a candidate
+            candidates = [(s, e) for (s, e, lab) in pieces if lab != "cut"]
+        _l(log, f"[Review] Prepared {len(candidates)} candidate clips.")
+        _p(progress, 0.80)
+        return {
+            "review_mode": True,
+            "input_path": input_path,
+            "duration": duration,
+            "candidates": candidates,
+            "events_count": len(events),
+        }
+
+    # Render (normal flow)
     if cfg.get("hdr_preserve", False):
         _l(log, "[Render] HDR-preserve via FFmpeg (10-bit)…")
         out_path = render_with_ffmpeg_hdr(input_path, cfg, pieces)
@@ -192,13 +217,12 @@ def run_pipeline(
             overlays = find_overlay_events(segments_orig, triggers, assets, cfg)
         _l(log, "[Render] MoviePy SDR path…")
         out_path = render_with_moviepy(input_path, cfg, pieces, overlays)
-    _p(progress, 0.86)
-    if cancelled(): raise RuntimeError("Cancelled")
+    _p(progress, 0.92)
 
     # Transcribe final for verification
     _l(log, "[ASR] Transcribing final output…")
     segments_final = transcribe_audio(out_path, cfg, purpose="final")
-    save_transcript_txt("output/details/transcript_final.txt", segments_final, "Final transcript")
+    save_transcript_txt(details_path(cfg, "transcript_final.txt"), segments_final, "Final transcript")
 
     _p(progress, 1.0)
     _l(log, f"[Done] {out_path}")
@@ -206,4 +230,49 @@ def run_pipeline(
         "output_path": out_path,
         "pieces_count": len(pieces),
         "events_count": len(events),
+        "review_mode": False,
     }
+
+def finalize_render_with_keeps(
+    input_path: str,
+    config_path: str,
+    approved_windows: Sequence[Tuple[float, float]],
+    *,
+    log: Optional[Callable[[str], None]] = None,
+    progress: Optional[Callable[[float], None]] = None,
+) -> dict:
+    """
+    Renders ONLY the approved windows.
+    """
+    import yaml
+    if not os.path.isfile(input_path):
+        raise FileNotFoundError(f"Input not found: {input_path}")
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"Config not found: {config_path}")
+
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f) or {}
+
+    _l(log, "[Finalize] Preparing keep-only pieces…")
+    with VideoFileClip(input_path) as clip:
+        duration = clip.duration or 0.0
+    pieces = build_keep_only_pieces(duration, list(approved_windows))
+    if not pieces:
+        raise RuntimeError("No approved clips to render.")
+
+    _p(progress, 0.2)
+    if cfg.get("hdr_preserve", False):
+        _l(log, "[Finalize] Rendering HDR via FFmpeg…")
+        out_path = render_with_ffmpeg_hdr(input_path, cfg, pieces)
+    else:
+        _l(log, "[Finalize] Rendering SDR via MoviePy…")
+        out_path = render_with_moviepy(input_path, cfg, pieces, overlays=[])
+    _p(progress, 0.9)
+
+    _l(log, "[Finalize] Transcribing final output…")
+    segments_final = transcribe_audio(out_path, cfg, purpose="final")
+    save_transcript_txt(details_path(cfg, "transcript_final.txt"), segments_final, "Final transcript")
+    _p(progress, 1.0)
+
+    _l(log, f"[Finalize] Done → {out_path}")
+    return {"output_path": out_path, "pieces_count": len(pieces)}
