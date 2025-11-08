@@ -92,7 +92,7 @@ class CheckStyle(QtWidgets.QProxyStyle):
                 p.moveTo(r.left() + r.width() * 0.22, r.center().y())
                 p.lineTo(r.left() + r.width() * 0.45, r.bottom() - r.height() * 0.22)
                 p.lineTo(r.right() - r.width() * 0.20, r.top() + r.height() * 0.28)
-                painter.setPen(QtGui.QPen(QtGui.QColor("#000000"), 2.2, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
+                painter.setPen(QtGui.QPen(col_check, 2.2, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
                 painter.drawPath(p)
 
             painter.restore()
@@ -218,7 +218,6 @@ class ClipPlayer(QtCore.QObject):
             try:
                 cap.release()
             except Exception:
-                # Best-effort release; ignore secondary errors
                 pass
             self.finished.emit()
 
@@ -493,19 +492,22 @@ class MainWindow(QtWidgets.QMainWindow):
         r = self._current_row()
         if r < 0 or not self._review_video_path:
             return
+        s_item = self.table.item(r, 1)
+        e_item = self.table.item(r, 2)
+        if s_item is None or e_item is None:
+            return  # missing cells
         try:
-            s = float(self.table.item(r, 1).text())
-            e = float(self.table.item(r, 2).text())
-        except ValueError:
-            # Skip if cells are malformed/empty
-            return
+            s = float(s_item.text())
+            e = float(e_item.text())
+        except (TypeError, ValueError):
+            return  # malformed cells
         self._stop_player_if_any()
         self._player_thread = QtCore.QThread(self)
         self._player = ClipPlayer(self._review_video_path, s, e, fps_hint=30)
         self._player.moveToThread(self._player_thread)
         self._player_thread.started.connect(self._player.play)
         self._player.frameReady.connect(self._on_frame)
-        self._player.error.connect(self._append_log)          # <-- log player errors
+        self._player.error.connect(self._append_log)
         self._player.finished.connect(self._player_thread.quit)
         self._player_thread.finished.connect(self._cleanup_player)
         self._player_thread.start()
@@ -525,14 +527,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._player_thread = None
 
     def _on_toggle_all(self):
+        # Determine if all are currently checked (treat missing items as unchecked)
         all_checked = True
         for r in range(self.table.rowCount()):
-            if self.table.item(r, 0).checkState() != QtCore.Qt.Checked:
+            item = self.table.item(r, 0)
+            if item is None or item.checkState() != QtCore.Qt.Checked:
                 all_checked = False
                 break
         target = QtCore.Qt.Unchecked if all_checked else QtCore.Qt.Checked
         for r in range(self.table.rowCount()):
-            self.table.item(r, 0).setCheckState(target)
+            item = self.table.item(r, 0)
+            if item is not None:
+                item.setCheckState(target)
 
     def _on_finalize(self):
         if not self._review_video_path:
@@ -543,15 +549,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
         approved: List[Tuple[float, float]] = []
         for r in range(self.table.rowCount()):
-            if self.table.item(r, 0).checkState() == QtCore.Qt.Checked:
-                try:
-                    s = float(self.table.item(r, 1).text())
-                    e = float(self.table.item(r, 2).text())
-                    if e > s:
-                        approved.append((s, e))
-                except ValueError:
-                    # Skip rows with invalid float conversion (e.g., empty or malformed cells)
-                    continue
+            item0 = self.table.item(r, 0)
+            item1 = self.table.item(r, 1)
+            item2 = self.table.item(r, 2)
+            if item0 is None or item0.checkState() != QtCore.Qt.Checked:
+                continue
+            if item1 is None or item2 is None:
+                continue
+            try:
+                s = float(item1.text())
+                e = float(item2.text())
+                if e > s:
+                    approved.append((s, e))
+            except (TypeError, ValueError):
+                continue  # skip malformed rows
 
         if not approved:
             QtWidgets.QMessageBox.information(self, "No clips selected", "Select at least one clip to render."); return
@@ -590,7 +601,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------- Rendering helpers ----------
 
     def _on_frame(self, qimg: QtGui.QImage, t_sec: float):
-        if self._player is None and not self.chk_preview.isChecked():
+        # Only display frames if a player is active OR preview is enabled during scanning.
+        if not (self._player or self.chk_preview.isChecked()):
             return
         self._last_qimage = qimg
         pix = QtGui.QPixmap.fromImage(qimg)
