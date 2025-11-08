@@ -1,14 +1,30 @@
 # cod_auto_editor/analysis.py
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Callable
 import numpy as np
 import cv2
+import logging
+import traceback
 from moviepy.editor import VideoFileClip
 from .intervals import merge_intervals, clamp
 
-def compute_motion_array(video_path: str, fps_sample: int = 5) -> Tuple[np.ndarray, np.ndarray, float]:
+logger = logging.getLogger(__name__)
+
+def compute_motion_array(
+    video_path: str,
+    fps_sample: int = 5,
+    cb_frame: Optional[Callable[[np.ndarray, float], None]] = None,
+    cb_error: Optional[Callable[[str], None]] = None,
+) -> Tuple[np.ndarray, np.ndarray, float]:
     """
     Returns (times_sec, motion_norm, sample_fps)
     motion_norm ~ [0..1] based on frame-to-frame grayscale absdiff.
+
+    If cb_frame is provided, it's called periodically as:
+        cb_frame(frame_bgr, t_sec)
+
+    If cb_error is provided, preview-callback exceptions are reported as:
+        cb_error(str_with_traceback)
+    Otherwise a module-level warning is logged.
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -22,6 +38,10 @@ def compute_motion_array(video_path: str, fps_sample: int = 5) -> Tuple[np.ndarr
     prev = None
     vals: List[float] = []
     times: List[float] = []
+
+    # Send a preview roughly every N grabbed frames (kept light)
+    preview_stride = max(1, step)
+
     while True:
         ok = cap.grab()
         if not ok:
@@ -41,6 +61,21 @@ def compute_motion_array(video_path: str, fps_sample: int = 5) -> Tuple[np.ndarr
             t = (idx / src_fps) if src_fps else 0.0
             times.append(t)
             vals.append(diff_val)
+
+            # live preview callback
+            if cb_frame and (idx % preview_stride == 0):
+                try:
+                    cb_frame(frame, t)
+                except Exception as e:
+                    msg = f"[compute_motion_array.preview] {e}\n{traceback.format_exc()}"
+                    if cb_error is not None:
+                        try:
+                            cb_error(msg)
+                        except Exception:
+                            # Avoid cascading failures from the error callback itself
+                            logger.warning(msg)
+                    else:
+                        logger.warning(msg)
         idx += 1
 
     cap.release()
@@ -66,7 +101,6 @@ def compute_audio_rms_array(clip: VideoFileClip, step: float = 0.5) -> Tuple[np.
     ts = np.arange(0.0, dur, step, dtype=np.float32)
     vals: List[float] = []
     for t in ts:
-        # get a tiny slice around t to estimate RMS
         a = clip.audio.to_soundarray(t, nbytes=2, fps=24000)
         if a is None or len(a) == 0:
             vals.append(0.0)
@@ -93,16 +127,13 @@ def detect_downtime(t_audio: np.ndarray,
     if t_audio.size == 0 or t_motion.size == 0:
         return []
 
-    # resample motion onto audio timestamps for a common grid
     tm = t_motion
     mm = motion_norm
     ta = t_audio
     am = audio_norm
 
-    # linear interp motion -> audio grid
     interp_motion = np.interp(ta, tm, mm, left=mm[0], right=mm[-1])
 
-    # thresholds
     a_thr = cfg.get("audio_threshold", "auto")
     m_thr = cfg.get("motion_threshold", "auto")
 
@@ -118,7 +149,6 @@ def detect_downtime(t_audio: np.ndarray,
 
     low = (am <= thr_a) & (interp_motion <= thr_m)
 
-    # build intervals on audio grid
     step = float(ta[1] - ta[0]) if len(ta) > 1 else 0.5
     min_len = float(cfg.get("min_downtime_sec", 3.0))
     min_frames = max(1, int(round(min_len / max(1e-6, step))))
