@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 /**
- * Dependabot PR → Jira Bug (Site mode or EX mode)
- * - Parses Dependabot PRs (single & grouped) to extract upgrades
- * - Calls GitHub Models via models.github.ai to draft Jira BUG content
- * - Searches Jira for duplicates (new /search/jql API), else creates a new issue
- * - Fails the job if the LLM cannot be used with the preferred model
+ * Dependabot PR → Jira Bug
+ * - Extracts packages from PR title/body
+ * - Uses GitHub Models to draft Title/Description/AC/DoD
+ * - Searches Jira for existing issue mentioning the PR URL (new /search/jql)
+ * - Creates Jira issue with labels and optional Story Points
+ * - Fails (by design) if the preferred LLM model cannot be used
  */
 
 const https = require('https');
@@ -13,21 +14,22 @@ const fs = require('fs');
 const {
   DEBUG,
 
-  // EX gateway (optional alternative to site)
-  JIRA_EX_BASE,           // e.g. https://api.atlassian.com/ex/jira
+  // EX gateway (optional; we’re using Site mode in your setup)
+  JIRA_EX_BASE,
   JIRA_CLOUD_ID,
 
-  // Site API (preferred in your setup)
+  // Site API (preferred here)
   JIRA_API_BASE,
 
-  // optional explicit mode override: "ex" or "site"
+  // explicit override: "ex" or "site"
   JIRA_MODE,
 
-  // Common Jira
+  // Common
   JIRA_EMAIL,
   JIRA_API_TOKEN,
   JIRA_PROJECT_KEY,
-  JIRA_ISSUE_TYPE,
+  JIRA_ISSUE_TYPE_ID = '',
+  JIRA_ISSUE_TYPE = '',
   JIRA_DEFAULT_LABELS = '',
   JIRA_STORY_POINTS_FIELD_ID = '',
   JIRA_STORY_POINTS_VALUE = '',
@@ -40,19 +42,17 @@ const {
   PR_HTML_URL,
   REPO,
 
-  // Models
+  // GitHub Models
   GH_MODELS_TOKEN,
   GITHUB_TOKEN,
 
   USE_LLM = 'true',
-  PREFERRED_MODEL: RAW_PREFERRED_MODEL
+  PREFERRED_MODEL = 'openai/gpt-5-nano'
 } = process.env;
 
-// Hard default even if the env var comes in as an empty string
-const PREFERRED_MODEL = (RAW_PREFERRED_MODEL && RAW_PREFERRED_MODEL.trim()) || 'openai/gpt-5-nano';
 const MODELS_TOKEN = GH_MODELS_TOKEN || GITHUB_TOKEN;
-
 const REQUEST_TIMEOUT_MS = 20000;
+
 const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
 
 function httpJson({ method, host, path, headers = {} }, body) {
@@ -100,50 +100,36 @@ function jiraHostAndPathBuilder() {
     return {
       mode,
       host,
-      path: (p) => {
-        const clean = p.startsWith('/') ? p : `/${p}`;
-        return `/ex/jira/${encodeURIComponent(JIRA_CLOUD_ID)}/rest/api/3${clean}`;
-      }
+      path: (p) => `/ex/jira/${encodeURIComponent(JIRA_CLOUD_ID)}/rest/api/3${p.startsWith('/') ? p : `/${p}`}`
     };
   } else {
     const host = new URL(JIRA_API_BASE).hostname;
     return {
       mode,
       host,
-      path: (p) => {
-        const clean = p.startsWith('/') ? p : `/${p}`;
-        return `/rest/api/3${clean}`;
-      }
+      path: (p) => `/rest/api/3${p.startsWith('/') ? p : `/${p}`}`
     };
   }
 }
 
-/** Extract upgrades from Dependabot PRs (single AND grouped formats) */
 function extractPackages(prTitle, prBody) {
   const pkgs = new Set();
   const upgrades = [];
   const ver = '([0-9A-Za-z.+-]+)';
 
-  // Single bump in title: "Bump foo from X to Y"
   const t = prTitle?.match(new RegExp(`Bump\\s+([@\\w\\/.-]+)\\s+from\\s+${ver}\\s+to\\s+${ver}`, 'i'));
   if (t) { pkgs.add(t[1]); upgrades.push({ name: t[1], from: t[2], to: t[3] }); }
 
   if (prBody) {
-    // Old bullet format: "* foo from X to Y"
+    const re = new RegExp(String.raw`(?<=\|\s*@?[\w\/\.-]+\s*\|\s*`)${ver}(?=`\s*\|\s*`)${ver}(?=`\s*\|)`, 'g'); // table fallback
+    // Additionally parse bullet lines like "* pkg from X to Y"
     const reBullets = new RegExp(String.raw`(?<=\* )([@\w\/.-]+)\s+from\s+${ver}\s+to\s+${ver}`, 'gi');
+
     for (const m of prBody.matchAll(reBullets)) {
       pkgs.add(m[1]);
       upgrades.push({ name: m[1], from: m[2], to: m[3] });
     }
-
-    // Grouped PR lines: "Updates `pkg` from X to Y"
-    const reUpdates = new RegExp(String.raw`Updates\s+\`([@\w\/.-]+)\`\s+from\s+${ver}\s+to\s+${ver}`, 'gi');
-    for (const m of prBody.matchAll(reUpdates)) {
-      pkgs.add(m[1]);
-      upgrades.push({ name: m[1], from: m[2], to: m[3] });
-    }
   }
-
   return { packages: Array.from(pkgs), upgrades };
 }
 
@@ -156,7 +142,6 @@ function sanitizeLabel(s) {
     .slice(0, 200);
 }
 
-/** Call GitHub Models; if it fails, throw with rich diagnostics */
 async function generateWithGitHubModels(ctx) {
   if (!MODELS_TOKEN) {
     const e = new Error('missing_token');
@@ -169,7 +154,8 @@ async function generateWithGitHubModels(ctx) {
     messages: [
       {
         role: "system",
-        content: "You are a release/QA engineer. Produce crisp Jira BUG ticket content from dependency upgrade PRs."
+        content:
+          "You are a release/QA engineer. Produce crisp Jira BUG ticket content from dependency upgrade PRs. Always respond ONLY with a single JSON object."
       },
       {
         role: "user",
@@ -184,7 +170,7 @@ Title: ${ctx.prTitle}
 Parsed upgrades:
 ${ctx.upgrades.map(u => `- ${u.name}: ${u.from} → ${u.to}`).join('\n')}
 
-PR body (truncated):
+PR body (truncated to 3k chars):
 ${(ctx.prBody || '').slice(0, 3000)}`
           },
           {
@@ -202,51 +188,23 @@ ${(ctx.prBody || '').slice(0, 3000)}`
         ]
       }
     ]
-    // Note: do NOT set temperature for nano; some models only accept default.
   };
 
-  let res;
-  try {
-    res = await httpJson(
-      {
-        method: 'POST',
-        host: 'models.github.ai',
-        path: '/inference/chat/completions',
-        headers: {
-          'User-Agent': 'gh-models-jira-bot',
-          'Authorization': `Bearer ${MODELS_TOKEN}`,
-          'Accept': 'application/json',
-          'X-GitHub-Api-Version': '2022-11-28',
-          'Content-Type': 'application/json'
-        }
-      },
-      body
-    );
-  } catch (err) {
-    // Enrich failure with catalog (what models are visible?)
-    try {
-      const cat = await httpJson(
-        {
-          method: 'GET',
-          host: 'models.github.ai',
-          path: '/catalog/models',
-          headers: {
-            'User-Agent': 'gh-models-jira-bot',
-            'Authorization': `Bearer ${MODELS_TOKEN}`,
-            'Accept': 'application/json'
-          }
-        }
-      );
-      console.error('Catalog models visible to token:', JSON.stringify(cat.data, null, 2));
-    } catch (catErr) {
-      if (DEBUG === 'true') {
-        console.error('Failed to retrieve /catalog/models');
-        console.error('Status:', catErr.status || '');
-        console.error('Response body:', JSON.stringify(catErr.body || catErr, null, 2));
+  const res = await httpJson(
+    {
+      method: 'POST',
+      host: 'models.github.ai',
+      path: '/inference/chat/completions',
+      headers: {
+        'User-Agent': 'gh-models-jira-bot',
+        'Authorization': `Bearer ${MODELS_TOKEN}`,
+        'Accept': 'application/json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'Content-Type': 'application/json'
       }
-    }
-    throw err;
-  }
+    },
+    body
+  );
 
   const content = res?.data?.choices?.[0]?.message?.content;
   if (!content) {
@@ -294,11 +252,10 @@ function validateModelResponseSchema(obj) {
 }
 
 function jiraClient() {
-  const { mode, host, path } = jiraHostAndPathBuilder();
+  const { host, path } = jiraHostAndPathBuilder();
   const auth = `Basic ${b64(`${JIRA_EMAIL}:${JIRA_API_TOKEN}`)}`;
 
   return {
-    mode,
     async get(p) {
       return httpJson(
         { method: 'GET', host, path: path(p), headers: { 'Authorization': auth, 'Accept': 'application/json' } }
@@ -313,19 +270,16 @@ function jiraClient() {
   };
 }
 
-// ✅ Use the new multi-query endpoint to avoid 410
+// NEW: use /search/jql as required by Jira deprecation/migration
 async function jiraSearchByText(jira, text) {
   if (!text || !text.trim()) return null;
   const safe = text.replace(/["\\]/g, '\\$&');
   const jql = `project = ${JIRA_PROJECT_KEY} AND text ~ "${safe}" ORDER BY created DESC`;
-  const body = {
-    queries: [
-      { query: jql, startAt: 0, maxResults: 1, fields: ['key'] }
-    ]
-  };
+
+  // POST /rest/api/3/search/jql  { query, startAt, maxResults, fields }
+  const body = { query: jql, startAt: 0, maxResults: 1, fields: ["key"] };
   const res = await jira.post('/search/jql', body);
-  const first = res.data?.results?.[0];
-  const issue = first?.issues?.[0];
+  const issue = res.data?.issues?.[0];
   return issue ?? null;
 }
 
@@ -351,18 +305,17 @@ function buildBrowseUrl(issueKey) {
 
 (async () => {
   try {
-    // Required env
     for (const [k, v] of Object.entries({ JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY })) {
       if (!v) throw new Error(`Missing required env: ${k}`);
     }
     if (USE_LLM === 'true' && !MODELS_TOKEN) {
       throw new Error('Missing required env: GH_MODELS_TOKEN or GITHUB_TOKEN');
     }
-
     pickMode();
+
     const jira = jiraClient();
 
-    // Quick auth check (already done in workflow, but nice here too)
+    // Basic auth check
     try {
       const me = await jira.get('/myself');
       if (DEBUG === 'true') console.log('Authenticated Jira user:', me.data && (me.data.displayName || me.data.name || 'ok'));
@@ -377,11 +330,12 @@ function buildBrowseUrl(issueKey) {
 
     const { packages, upgrades } = extractPackages(PR_TITLE, PR_BODY);
 
-    // De-dupe by PR URL using new /search/jql
+    // Try to avoid duplicate creation if PR URL already mentioned
     let existing = null;
     if (PR_HTML_URL && PR_HTML_URL.trim()) {
-      try { existing = await jiraSearchByText(jira, PR_HTML_URL); }
-      catch (e) {
+      try {
+        existing = await jiraSearchByText(jira, PR_HTML_URL);
+      } catch (e) {
         console.warn('Jira search failed; continuing to create.', DEBUG === 'true' ? e : '');
       }
     }
@@ -393,7 +347,7 @@ function buildBrowseUrl(issueKey) {
       return;
     }
 
-    // Generate with LLM (hard fail if we cannot use it)
+    // LLM generation is required; fail on any issue with preferred model (as requested)
     let gen;
     if (USE_LLM === 'true') {
       try {
@@ -424,12 +378,16 @@ function buildBrowseUrl(issueKey) {
 
     const ac = (gen.acceptance_criteria || []).map(i => `- ${i}`).join('\n');
     const dod = (gen.definition_of_done || []).map(i => `- ${i}`).join('\n');
-    const extras =
-      `\n\n*Acceptance Criteria*\n${ac}\n\n*Definition of Done*\n${dod}\nPR: ${PR_HTML_URL}\n`;
+    const extras = `\n\n*Acceptance Criteria*\n${ac}\n\n*Definition of Done*\n${dod}\nPR: ${PR_HTML_URL}\n`;
+
+    // Prefer issue type ID if provided
+    const issueTypeField = JIRA_ISSUE_TYPE_ID
+      ? { id: JIRA_ISSUE_TYPE_ID }
+      : { name: (JIRA_ISSUE_TYPE || 'Bug') };
 
     const fields = {
       project: { key: JIRA_PROJECT_KEY },
-      issuetype: { name: JIRA_ISSUE_TYPE || 'Bug' },
+      issuetype: issueTypeField,
       summary: gen.title || `[Dependabot] ${PR_TITLE}`,
       description: {
         type: 'doc',
