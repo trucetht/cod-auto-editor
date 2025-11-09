@@ -1,32 +1,29 @@
-name: Dependabot PR to Jira Bug
+name: Dependabot → Jira Bug
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize, edited]
-    branches: ["**"]
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+  models: read
 
 jobs:
   create-jira-bug:
-    if: github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
 
-    permissions:
-      contents: read
-      pull-requests: write
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
+      - uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Preflight Jira auth/scope
+      - name: Jira auth check (EX or Site)
         shell: bash
+        env:
+          JIRA_EX_BASE: ${{ vars.JIRA_EX_BASE }}
+          JIRA_CLOUD_ID: ${{ vars.JIRA_CLOUD_ID }}
+          JIRA_API_BASE: ${{ vars.JIRA_API_BASE }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
         run: |
           set -euo pipefail
           if [[ -n "${JIRA_EX_BASE:-}" && -n "${JIRA_CLOUD_ID:-}" ]]; then
@@ -50,35 +47,33 @@ jobs:
             exit 1
           fi
           echo "OK: Token + scopes valid"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Create Jira ticket from Dependabot PR
+        id: create-jira
         env:
-          JIRA_EX_BASE: ${{ secrets.JIRA_EX_BASE }}
-          JIRA_CLOUD_ID: ${{ secrets.JIRA_CLOUD_ID }}
-          JIRA_API_BASE: ${{ secrets.JIRA_API_BASE }}
+          DEBUG: "true"
+          USE_LLM: ${{ vars.USE_LLM }}                # e.g. true
+          PREFERRED_MODEL: ${{ vars.PREFERRED_MODEL }} # e.g. openai/gpt-5-nano or your model id
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          JIRA_EX_BASE: ${{ vars.JIRA_EX_BASE }}
+          JIRA_CLOUD_ID: ${{ vars.JIRA_CLOUD_ID }}
+          JIRA_API_BASE: ${{ vars.JIRA_API_BASE }}
+
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT_KEY: ${{ vars.JIRA_PROJECT_KEY }}
+          JIRA_ISSUE_TYPE: ${{ vars.JIRA_ISSUE_TYPE }}
+          JIRA_DEFAULT_LABELS: ${{ vars.JIRA_DEFAULT_LABELS }}
+          JIRA_STORY_POINTS_FIELD_ID: ${{ vars.JIRA_STORY_POINTS_FIELD_ID }}
+          JIRA_STORY_POINTS_VALUE: ${{ vars.JIRA_STORY_POINTS_VALUE }}
+          JIRA_BROWSE_BASE: ${{ vars.JIRA_BROWSE_BASE }}
 
-      - name: Generate ticket & create in Jira
-        id: jira
-        env:
-          DEBUG: ${{ secrets.DEBUG }}
-          USE_LLM: 'true'
-          PREFERRED_MODEL: ${{ secrets.PREFERRED_MODEL }}
-          GH_MODELS_TOKEN: ${{ github.token }}
-
-          # Jira (EX or Site)
-          JIRA_EX_BASE: ${{ secrets.JIRA_EX_BASE }}
-          JIRA_CLOUD_ID: ${{ secrets.JIRA_CLOUD_ID }}
-          JIRA_API_BASE: ${{ secrets.JIRA_API_BASE }}
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
-          JIRA_ISSUE_TYPE: ${{ secrets.JIRA_ISSUE_TYPE }}
-          JIRA_DEFAULT_LABELS: ${{ secrets.JIRA_DEFAULT_LABELS }}
-          JIRA_STORY_POINTS_FIELD_ID: ${{ secrets.JIRA_STORY_POINTS_FIELD_ID }}
-          JIRA_STORY_POINTS_VALUE: ${{ secrets.JIRA_STORY_POINTS_VALUE }}
-          JIRA_BROWSE_BASE: ${{ secrets.JIRA_BROWSE_BASE }}
-
-          # PR context
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -86,9 +81,10 @@ jobs:
           REPO: ${{ github.repository }}
         run: node .github/workflows/scripts/create-jira-ticket-from-dependabot.ex.cjs
 
-      - name: Comment back on PR with Jira issue
-        if: steps.jira.outputs.jira_key != ''
+      - name: Comment PR with Jira link
+        if: ${{ success() && steps.create-jira.outputs.jira_key != '' }}
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh pr comment ${{ github.event.pull_request.number }} --body "Jira bug created: **${{ steps.jira.outputs.jira_key }}** – ${{ steps.jira.outputs.jira_url }}"
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body "Jira bug created: **${{ steps.create-jira.outputs.jira_key }}** – ${{ steps.create-jira.outputs.jira_url }}"
