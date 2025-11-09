@@ -1,6 +1,6 @@
 moviepy==1.0.3
 opencv-python==4.10.0.84
-numpy==1.26.4
+numpy==2.0.2
 PyYAML==6.0.2
 faster-whisper==1.0.3
 psycopg2-binary==2.9.9
