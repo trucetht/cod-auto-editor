@@ -46,10 +46,10 @@ const {
   REPO,
 
   // GitHub Models
-  GH_MODELS_TOKEN,
+  GITHUB_TOKEN,
 
   USE_LLM = 'true',
-  PREFERRED_MODEL = 'openai/gpt-5-mini'
+  PREFERRED_MODEL = 'openai/gpt-5-nano'
 } = process.env;
 
 const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
@@ -116,7 +116,7 @@ function extractPackages(prTitle, prBody) {
   const pkgs = new Set();
   const upgrades = [];
 
-  const ver = '([0-9A-Za-z.+-]+)'; // allow + and uppercase
+  const ver = '([0-9A-Za-z.+-]+)';
   const t = prTitle?.match(new RegExp(`Bump\\s+([@\\w\\/.-]+)\\s+from\\s+${ver}\\s+to\\s+${ver}`, 'i'));
   if (t) { pkgs.add(t[1]); upgrades.push({ name: t[1], from: t[2], to: t[3] }); }
 
@@ -169,11 +169,11 @@ ${(ctx.prBody || '').slice(0, 3000)}`
             text:
 `Return STRICT JSON:
 {
-  "title": string,                       // must start with "[Dependabot]"
-  "description": string,                 // why, what changed, risk, links
-  "acceptance_criteria": [string, ...],  // testable bullets
-  "definition_of_done": [string, ...],   // bullets incl. rollback & staging validation
-  "labels": [string, ...]                // include 'dependabot' and package names
+  "title": string,
+  "description": string,
+  "acceptance_criteria": [string, ...],
+  "definition_of_done": [string, ...],
+  "labels": [string, ...]
 }`
           }
         ]
@@ -189,7 +189,7 @@ ${(ctx.prBody || '').slice(0, 3000)}`
       path: '/inference/chat/completions',
       headers: {
         'User-Agent': 'gh-models-jira-bot',
-        'Authorization': `Bearer ${GH_MODELS_TOKEN}`,
+        'Authorization': `Bearer ${GITHUB_TOKEN}`,
         'Accept': 'application/json',
         'X-GitHub-Api-Version': '2022-11-28',
         'Content-Type': 'application/json'
@@ -208,6 +208,7 @@ ${(ctx.prBody || '').slice(0, 3000)}`
   catch { throw new Error('Malformed JSON in model response'); }
 
   validateModelResponseSchema(parsed);
+
   return parsed;
 }
 
@@ -248,13 +249,19 @@ function jiraClient() {
   };
 }
 
-// Search via POST /search (works broadly across Jira Cloud tiers)
+// New search via POST /search/jql
 async function jiraSearchByText(jira, text) {
   if (!text || !text.trim()) return null;
   const safe = text.replace(/["\\]/g, '\\$&');
   const jql = `project = ${JIRA_PROJECT_KEY} AND text ~ "${safe}" ORDER BY created DESC`;
-  const res = await jira.post('/search', { jql, startAt: 0, maxResults: 1, fields: ['key'] });
-  const issue = res.data?.issues?.[0];
+  const body = {
+    queries: [
+      { query: jql, startAt: 0, maxResults: 1, fields: ["key"] }
+    ]
+  };
+  const res = await jira.post('/search/jql', body);
+  const first = res.data?.results?.[0];
+  const issue = first?.issues?.[0];
   return issue ?? null;
 }
 
@@ -278,54 +285,71 @@ function buildBrowseUrl(issueKey) {
   return `${base}/browse/${issueKey}`;
 }
 
-(function main() {
-  (async () => {
+function fallbackTicket(ctx) {
+  const title = `[Dependabot] ${ctx.prTitle || 'Dependency update'}`.slice(0, 255);
+  const lines = [];
+  if (ctx.upgrades && ctx.upgrades.length) {
+    lines.push('Upgrades:');
+    for (const u of ctx.upgrades) lines.push(`- ${u.name}: ${u.from} → ${u.to}`);
+  }
+  const desc = [
+    `Automated ticket generated without LLM due to model access.`,
+    lines.join('\n'),
+    `PR: ${ctx.prUrl}`
+  ].filter(Boolean).join('\n\n');
+  return {
+    title,
+    description: desc,
+    acceptance_criteria: [],
+    definition_of_done: [],
+    labels: []
+  };
+}
+
+(async () => {
+  try {
+    for (const [k, v] of Object.entries({ JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY, GITHUB_TOKEN })) {
+      if (!v) throw new Error(`Missing required env: ${k}`);
+    }
+    pickMode();
+
+    const jira = jiraClient();
+
     try {
-      for (const [k, v] of Object.entries({ JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY, GH_MODELS_TOKEN })) {
-        if (!v) throw new Error(`Missing required env: ${k}`);
+      const me = await jira.get('/myself');
+      if (DEBUG === 'true') console.log('Authenticated Jira user:', me.data && (me.data.displayName || me.data.name || 'ok'));
+    } catch (e) {
+      console.error('Jira auth/scope check failed.');
+      if (DEBUG === 'true') {
+        console.error('Status:', e.status);
+        console.error('Response:', JSON.stringify(e.body, null, 2));
       }
-      pickMode();
+      throw e;
+    }
 
-      const jira = jiraClient();
+    const { packages, upgrades } = extractPackages(PR_TITLE, PR_BODY);
 
-      // quick perms check
-      try {
-        const me = await jira.get('/myself');
-        if (DEBUG === 'true') console.log('Authenticated Jira user:', me.data && (me.data.displayName || me.data.name || 'ok'));
-      } catch (e) {
-        console.error('Jira auth/scope check failed.');
-        if (DEBUG === 'true') {
-          console.error('Status:', e.status);
-          console.error('Response:', JSON.stringify(e.body, null, 2));
-        }
-        throw e;
+    let existing = null;
+    if (PR_HTML_URL && PR_HTML_URL.trim()) {
+      try { existing = await jiraSearchByText(jira, PR_HTML_URL); }
+      catch (e) {
+        console.warn('Jira search failed; continuing to create.', DEBUG === 'true' ? e : '');
       }
+    }
+    if (existing) {
+      const url = buildBrowseUrl(existing.key);
+      setOutput('jira_key', existing.key);
+      setOutput('jira_url', url);
+      console.log(`Found existing Jira issue ${existing.key} -> ${url}`);
+      return;
+    }
 
-      const { packages, upgrades } = extractPackages(PR_TITLE, PR_BODY);
-
-      // de-dupe if PR URL already in Jira text search
-      let existing = null;
-      if (PR_HTML_URL && PR_HTML_URL.trim()) {
-        try { existing = await jiraSearchByText(jira, PR_HTML_URL); }
-        catch (e) {
-          console.warn('Jira search failed; continuing to create.', DEBUG === 'true' ? e : '');
-        }
-      }
-      if (existing) {
-        const url = buildBrowseUrl(existing.key);
-        setOutput('jira_key', existing.key);
-        setOutput('jira_url', url);
-        console.log(`Found existing Jira issue ${existing.key} -> ${url}`);
-        return;
-      }
-
-      // LLM is required; if it fails, abort before ticket creation
-      if (USE_LLM !== 'true') {
-        console.error('USE_LLM is not true; refusing to create ticket without LLM content.');
+    let gen;
+    if (USE_LLM === 'true') {
+      if (!PREFERRED_MODEL) {
+        console.error('Missing PREFERRED_MODEL.');
         process.exit(1);
       }
-
-      let gen;
       try {
         gen = await generateWithGitHubModels({
           repo: REPO,
@@ -335,67 +359,77 @@ function buildBrowseUrl(issueKey) {
           upgrades
         });
       } catch (e) {
-        console.error('LLM request failed for preferred model:', PREFERRED_MODEL);
-        if (DEBUG === 'true') {
-          console.error('Status:', e.status || '');
+        console.error(`LLM request failed for preferred model: ${PREFERRED_MODEL}`);
+        if (e && (e.body || e.status)) {
+          if (e.status) console.error('Status:', e.status);
           console.error('Response body:', JSON.stringify(e.body || {}, null, 2));
+        } else {
+          console.error('Error details:', e);
         }
         console.error('Aborting ticket creation because the LLM could not be used with the preferred model.');
         process.exit(1);
       }
-
-      const defaults = (JIRA_DEFAULT_LABELS || '').split(',').map(s => s.trim()).filter(Boolean);
-      const parsedPkgLabels = packages.map(sanitizeLabel);
-      const modelLabels = Array.isArray(gen.labels) ? gen.labels.map(sanitizeLabel) : [];
-      const labels = Array.from(new Set(['dependabot', ...defaults, ...parsedPkgLabels, ...modelLabels]));
-
-      const ac = (gen.acceptance_criteria || []).map(i => `- ${i}`).join('\n');
-      const dod = (gen.definition_of_done || []).map(i => `- ${i}`).join('\n');
-      const extras = `\n\n*Acceptance Criteria*\n${ac}\n\n*Definition of Done*\n${dod}\nPR: ${PR_HTML_URL}\n`;
-
-      const fields = {
-        project: { key: JIRA_PROJECT_KEY },
-        issuetype: { name: JIRA_ISSUE_TYPE || 'Bug' },
-        summary: gen.title || `[Dependabot] ${PR_TITLE}`,
-        description: {
-          type: 'doc',
-          version: 1,
-          content: [
-            { type: 'paragraph', content: [{ type: 'text', text: (gen.description || '').slice(0, 60000) }] },
-            { type: 'paragraph', content: [{ type: 'text', text: extras.slice(0, 60000) }] }
-          ]
-        },
-        labels
-      };
-
-      if (JIRA_STORY_POINTS_FIELD_ID && JIRA_STORY_POINTS_VALUE !== '') {
-        const sp = Number(JIRA_STORY_POINTS_VALUE);
-        if (Number.isFinite(sp)) {
-          fields[JIRA_STORY_POINTS_FIELD_ID] = sp;
-        } else {
-          console.warn(`Ignored non-numeric Story Points: "${JIRA_STORY_POINTS_VALUE}"`);
-        }
-      }
-
-      const created = await jiraCreateIssue(jira, fields);
-      const key = created.key;
-      const browseUrl = buildBrowseUrl(key);
-
-      setOutput('jira_key', key);
-      setOutput('jira_url', browseUrl);
-
-      console.log(`Created Jira issue ${key} -> ${browseUrl}`);
-    } catch (err) {
-      console.error('Failed to create Jira issue.');
-      if (DEBUG === 'true') {
-        if (err && (err.body || err.status)) {
-          console.error('Status:', err.status);
-          console.error('Response body:', JSON.stringify(err.body, null, 2));
-        } else {
-          console.error('Error details:', err);
-        }
-      }
-      process.exit(1);
+    } else {
+      gen = fallbackTicket({
+        repo: REPO,
+        prUrl: PR_HTML_URL || '',
+        prTitle: PR_TITLE || '',
+        prBody: PR_BODY || '',
+        upgrades
+      });
     }
-  })();
+
+    const defaults = (JIRA_DEFAULT_LABELS || '').split(',').map(s => s.trim()).filter(Boolean);
+    const parsedPkgLabels = packages.map(sanitizeLabel);
+    const modelLabels = Array.isArray(gen.labels) ? gen.labels.map(sanitizeLabel) : [];
+    const labels = Array.from(new Set(['dependabot', ...defaults, ...parsedPkgLabels, ...modelLabels]));
+
+    const ac = (gen.acceptance_criteria || []).map(i => `- ${i}`).join('\n');
+    const dod = (gen.definition_of_done || []).map(i => `- ${i}`).join('\n');
+    const extras = `\n\n*Acceptance Criteria*\n${ac}\n\n*Definition of Done*\n${dod}\nPR: ${PR_HTML_URL}\n`;
+
+    const fields = {
+      project: { key: JIRA_PROJECT_KEY },
+      issuetype: { name: JIRA_ISSUE_TYPE || 'Bug' },
+      summary: gen.title || `[Dependabot] ${PR_TITLE}`,
+      description: {
+        type: 'doc',
+        version: 1,
+        content: [
+          { type: 'paragraph', content: [{ type: 'text', text: (gen.description || '').slice(0, 60000) }] },
+          { type: 'paragraph', content: [{ type: 'text', text: extras.slice(0, 60000) }] }
+        ]
+      },
+      labels
+    };
+
+    if (JIRA_STORY_POINTS_FIELD_ID && JIRA_STORY_POINTS_VALUE !== '') {
+      const sp = Number(JIRA_STORY_POINTS_VALUE);
+      if (Number.isFinite(sp)) {
+        fields[JIRA_STORY_POINTS_FIELD_ID] = sp;
+      } else {
+        console.warn(`Ignored non-numeric Story Points: "${JIRA_STORY_POINTS_VALUE}"`);
+      }
+    }
+
+    const created = await jiraCreateIssue(jira, fields);
+    const key = created.key;
+    const browseUrl = buildBrowseUrl(key);
+
+    setOutput('jira_key', key);
+    setOutput('jira_url', browseUrl);
+
+    console.log(`Created Jira issue ${key} -> ${browseUrl}`);
+  } catch (err) {
+    console.error('Failed to create Jira issue.');
+    if (DEBUG === 'true') {
+      if (err && (err.body || err.status)) {
+        console.error('Status:', err.status);
+        console.error('Response body:', JSON.stringify(err.body, null, 2));
+      } else {
+        console.error('Error details:', err);
+      }
+    }
+    process.exit(1);
+  }
 })();
