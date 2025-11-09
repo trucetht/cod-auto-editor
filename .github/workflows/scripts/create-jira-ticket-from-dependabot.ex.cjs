@@ -181,8 +181,7 @@ ${(ctx.prBody || '').slice(0, 3000)}`
           }
         ]
       }
-    ],
-    temperature: 0.2
+    ]
   };
 
   const res = await httpJson(
