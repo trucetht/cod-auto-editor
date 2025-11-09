@@ -1,15 +1,10 @@
 #!/usr/bin/env node
 /**
- * Dependabot PR → Jira Bug
- * - Extracts packages from PR title/body
- * - Uses GitHub Models to draft Title/Description/AC/DoD
- * - Searches Jira for existing issue mentioning the PR URL
- * - Creates Jira issue with labels and optional Story Points
- *
- * Notes:
- * - Uses scoped token against ex gateway for API calls
- * - Uses JIRA_BROWSE_BASE for URL
- * - Sets step outputs via $GITHUB_OUTPUT
+ * Dependabot PR → Jira Bug (Site mode or EX mode)
+ * - Parses Dependabot PRs (single & grouped) to extract upgrades
+ * - Calls GitHub Models via models.github.ai to draft Jira BUG content
+ * - Searches Jira for duplicates (new /search/jql API), else creates a new issue
+ * - Fails the job if the LLM cannot be used with the preferred model
  */
 
 const https = require('https');
@@ -18,17 +13,17 @@ const fs = require('fs');
 const {
   DEBUG,
 
-  // EX gateway
-  JIRA_EX_BASE,     // e.g. https://api.atlassian.com/ex/jira
+  // EX gateway (optional alternative to site)
+  JIRA_EX_BASE,           // e.g. https://api.atlassian.com/ex/jira
   JIRA_CLOUD_ID,
 
-  // Site API 
+  // Site API (preferred in your setup)
   JIRA_API_BASE,
 
   // optional explicit mode override: "ex" or "site"
   JIRA_MODE,
 
-  // Common
+  // Common Jira
   JIRA_EMAIL,
   JIRA_API_TOKEN,
   JIRA_PROJECT_KEY,
@@ -45,17 +40,19 @@ const {
   PR_HTML_URL,
   REPO,
 
-  // GitHub Models
+  // Models
   GH_MODELS_TOKEN,
   GITHUB_TOKEN,
 
   USE_LLM = 'true',
-  PREFERRED_MODEL = 'openai/gpt-5-nano'
+  PREFERRED_MODEL: RAW_PREFERRED_MODEL
 } = process.env;
 
+// Hard default even if the env var comes in as an empty string
+const PREFERRED_MODEL = (RAW_PREFERRED_MODEL && RAW_PREFERRED_MODEL.trim()) || 'openai/gpt-5-nano';
 const MODELS_TOKEN = GH_MODELS_TOKEN || GITHUB_TOKEN;
-const REQUEST_TIMEOUT_MS = 20000;
 
+const REQUEST_TIMEOUT_MS = 20000;
 const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
 
 function httpJson({ method, host, path, headers = {} }, body) {
@@ -121,21 +118,32 @@ function jiraHostAndPathBuilder() {
   }
 }
 
+/** Extract upgrades from Dependabot PRs (single AND grouped formats) */
 function extractPackages(prTitle, prBody) {
   const pkgs = new Set();
   const upgrades = [];
-
   const ver = '([0-9A-Za-z.+-]+)';
+
+  // Single bump in title: "Bump foo from X to Y"
   const t = prTitle?.match(new RegExp(`Bump\\s+([@\\w\\/.-]+)\\s+from\\s+${ver}\\s+to\\s+${ver}`, 'i'));
   if (t) { pkgs.add(t[1]); upgrades.push({ name: t[1], from: t[2], to: t[3] }); }
 
   if (prBody) {
-    const re = new RegExp(String.raw`(?<=\* )([@\w\/.-]+)\s+from\s+${ver}\s+to\s+${ver}`, 'gi');
-    for (const m of prBody.matchAll(re)) {
+    // Old bullet format: "* foo from X to Y"
+    const reBullets = new RegExp(String.raw`(?<=\* )([@\w\/.-]+)\s+from\s+${ver}\s+to\s+${ver}`, 'gi');
+    for (const m of prBody.matchAll(reBullets)) {
+      pkgs.add(m[1]);
+      upgrades.push({ name: m[1], from: m[2], to: m[3] });
+    }
+
+    // Grouped PR lines: "Updates `pkg` from X to Y"
+    const reUpdates = new RegExp(String.raw`Updates\s+\`([@\w\/.-]+)\`\s+from\s+${ver}\s+to\s+${ver}`, 'gi');
+    for (const m of prBody.matchAll(reUpdates)) {
       pkgs.add(m[1]);
       upgrades.push({ name: m[1], from: m[2], to: m[3] });
     }
   }
+
   return { packages: Array.from(pkgs), upgrades };
 }
 
@@ -148,6 +156,7 @@ function sanitizeLabel(s) {
     .slice(0, 200);
 }
 
+/** Call GitHub Models; if it fails, throw with rich diagnostics */
 async function generateWithGitHubModels(ctx) {
   if (!MODELS_TOKEN) {
     const e = new Error('missing_token');
@@ -160,8 +169,7 @@ async function generateWithGitHubModels(ctx) {
     messages: [
       {
         role: "system",
-        content:
-          "You are a release/QA engineer. Produce crisp Jira BUG ticket content from dependency upgrade PRs."
+        content: "You are a release/QA engineer. Produce crisp Jira BUG ticket content from dependency upgrade PRs."
       },
       {
         role: "user",
@@ -184,16 +192,17 @@ ${(ctx.prBody || '').slice(0, 3000)}`
             text:
 `Return STRICT JSON:
 {
-  "title": string,                       
-  "description": string,                 
-  "acceptance_criteria": [string, ...],  
-  "definition_of_done": [string, ...],   
-  "labels": [string, ...]                
+  "title": string,
+  "description": string,
+  "acceptance_criteria": [string, ...],
+  "definition_of_done": [string, ...],
+  "labels": [string, ...]
 }`
           }
         ]
       }
     ]
+    // Note: do NOT set temperature for nano; some models only accept default.
   };
 
   let res;
@@ -214,6 +223,28 @@ ${(ctx.prBody || '').slice(0, 3000)}`
       body
     );
   } catch (err) {
+    // Enrich failure with catalog (what models are visible?)
+    try {
+      const cat = await httpJson(
+        {
+          method: 'GET',
+          host: 'models.github.ai',
+          path: '/catalog/models',
+          headers: {
+            'User-Agent': 'gh-models-jira-bot',
+            'Authorization': `Bearer ${MODELS_TOKEN}`,
+            'Accept': 'application/json'
+          }
+        }
+      );
+      console.error('Catalog models visible to token:', JSON.stringify(cat.data, null, 2));
+    } catch (catErr) {
+      if (DEBUG === 'true') {
+        console.error('Failed to retrieve /catalog/models');
+        console.error('Status:', catErr.status || '');
+        console.error('Response body:', JSON.stringify(catErr.body || catErr, null, 2));
+      }
+    }
     throw err;
   }
 
@@ -282,13 +313,19 @@ function jiraClient() {
   };
 }
 
+// ✅ Use the new multi-query endpoint to avoid 410
 async function jiraSearchByText(jira, text) {
   if (!text || !text.trim()) return null;
   const safe = text.replace(/["\\]/g, '\\$&');
   const jql = `project = ${JIRA_PROJECT_KEY} AND text ~ "${safe}" ORDER BY created DESC`;
-  const body = { jql, startAt: 0, maxResults: 1, fields: ["key"] };
-  const res = await jira.post('/search', body);
-  const issue = res.data?.issues?.[0];
+  const body = {
+    queries: [
+      { query: jql, startAt: 0, maxResults: 1, fields: ['key'] }
+    ]
+  };
+  const res = await jira.post('/search/jql', body);
+  const first = res.data?.results?.[0];
+  const issue = first?.issues?.[0];
   return issue ?? null;
 }
 
@@ -314,16 +351,18 @@ function buildBrowseUrl(issueKey) {
 
 (async () => {
   try {
+    // Required env
     for (const [k, v] of Object.entries({ JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY })) {
       if (!v) throw new Error(`Missing required env: ${k}`);
     }
     if (USE_LLM === 'true' && !MODELS_TOKEN) {
       throw new Error('Missing required env: GH_MODELS_TOKEN or GITHUB_TOKEN');
     }
-    pickMode();
 
+    pickMode();
     const jira = jiraClient();
 
+    // Quick auth check (already done in workflow, but nice here too)
     try {
       const me = await jira.get('/myself');
       if (DEBUG === 'true') console.log('Authenticated Jira user:', me.data && (me.data.displayName || me.data.name || 'ok'));
@@ -338,6 +377,7 @@ function buildBrowseUrl(issueKey) {
 
     const { packages, upgrades } = extractPackages(PR_TITLE, PR_BODY);
 
+    // De-dupe by PR URL using new /search/jql
     let existing = null;
     if (PR_HTML_URL && PR_HTML_URL.trim()) {
       try { existing = await jiraSearchByText(jira, PR_HTML_URL); }
@@ -353,6 +393,7 @@ function buildBrowseUrl(issueKey) {
       return;
     }
 
+    // Generate with LLM (hard fail if we cannot use it)
     let gen;
     if (USE_LLM === 'true') {
       try {
@@ -383,7 +424,8 @@ function buildBrowseUrl(issueKey) {
 
     const ac = (gen.acceptance_criteria || []).map(i => `- ${i}`).join('\n');
     const dod = (gen.definition_of_done || []).map(i => `- ${i}`).join('\n');
-    const extras = `\n\n*Acceptance Criteria*\n${ac}\n\n*Definition of Done*\n${dod}\nPR: ${PR_HTML_URL}\n`;
+    const extras =
+      `\n\n*Acceptance Criteria*\n${ac}\n\n*Definition of Done*\n${dod}\nPR: ${PR_HTML_URL}\n`;
 
     const fields = {
       project: { key: JIRA_PROJECT_KEY },
