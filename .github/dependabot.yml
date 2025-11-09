@@ -5,7 +5,32 @@
 
 version: 2
 updates:
-  - package-ecosystem: "" # See documentation for possible values
-    directory: "/" # Location of package manifests
+  # Python deps (pip / setuptools with PEP 621 in pyproject.toml)
+  - package-ecosystem: "pip"
+    directory: "/"                  # where pyproject.toml is
+    schedule:
+      interval: "weekly"            # or daily/monthly
+      day: "monday"
+      time: "09:00"
+      timezone: "America/New_York"
+    allow:
+      - dependency-type: "direct"   # only bump your top-level deps
+    versioning-strategy: increase-if-necessary
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    labels: ["dependencies", "python"]
+    reviewers: ["trucetht"]         # or your team slug
+    assignees: ["trucetht"]
+
+  # GitHub Actions updates
+  - package-ecosystem: "github-actions"
+    directory: "/"
     schedule:
       interval: "weekly"
+      day: "monday"
+      time: "09:15"
+      timezone: "America/New_York"
+    labels: ["dependencies", "ci"]
+
