@@ -46,11 +46,14 @@ const {
   REPO,
 
   // GitHub Models
+  GH_MODELS_TOKEN,
   GITHUB_TOKEN,
 
   USE_LLM = 'true',
-  PREFERRED_MODEL = 'openai/gpt-5-nano'
+  PREFERRED_MODEL = 'gpt-5-mini'
 } = process.env;
+
+const MODELS_TOKEN = GH_MODELS_TOKEN || GITHUB_TOKEN;
 
 const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
 
@@ -169,11 +172,11 @@ ${(ctx.prBody || '').slice(0, 3000)}`
             text:
 `Return STRICT JSON:
 {
-  "title": string,
-  "description": string,
-  "acceptance_criteria": [string, ...],
-  "definition_of_done": [string, ...],
-  "labels": [string, ...]
+  "title": string,                       
+  "description": string,                 
+  "acceptance_criteria": [string, ...],  
+  "definition_of_done": [string, ...],   
+  "labels": [string, ...]                
 }`
           }
         ]
@@ -189,7 +192,7 @@ ${(ctx.prBody || '').slice(0, 3000)}`
       path: '/inference/chat/completions',
       headers: {
         'User-Agent': 'gh-models-jira-bot',
-        'Authorization': `Bearer ${GITHUB_TOKEN}`,
+        'Authorization': `Bearer ${MODELS_TOKEN}`,
         'Accept': 'application/json',
         'X-GitHub-Api-Version': '2022-11-28',
         'Content-Type': 'application/json'
@@ -249,19 +252,13 @@ function jiraClient() {
   };
 }
 
-// New search via POST /search/jql
 async function jiraSearchByText(jira, text) {
   if (!text || !text.trim()) return null;
   const safe = text.replace(/["\\]/g, '\\$&');
   const jql = `project = ${JIRA_PROJECT_KEY} AND text ~ "${safe}" ORDER BY created DESC`;
-  const body = {
-    queries: [
-      { query: jql, startAt: 0, maxResults: 1, fields: ["key"] }
-    ]
-  };
-  const res = await jira.post('/search/jql', body);
-  const first = res.data?.results?.[0];
-  const issue = first?.issues?.[0];
+  const body = { jql, startAt: 0, maxResults: 1, fields: ["key"] };
+  const res = await jira.post('/search', body);
+  const issue = res.data?.issues?.[0];
   return issue ?? null;
 }
 
@@ -285,31 +282,13 @@ function buildBrowseUrl(issueKey) {
   return `${base}/browse/${issueKey}`;
 }
 
-function fallbackTicket(ctx) {
-  const title = `[Dependabot] ${ctx.prTitle || 'Dependency update'}`.slice(0, 255);
-  const lines = [];
-  if (ctx.upgrades && ctx.upgrades.length) {
-    lines.push('Upgrades:');
-    for (const u of ctx.upgrades) lines.push(`- ${u.name}: ${u.from} → ${u.to}`);
-  }
-  const desc = [
-    `Automated ticket generated without LLM due to model access.`,
-    lines.join('\n'),
-    `PR: ${ctx.prUrl}`
-  ].filter(Boolean).join('\n\n');
-  return {
-    title,
-    description: desc,
-    acceptance_criteria: [],
-    definition_of_done: [],
-    labels: []
-  };
-}
-
 (async () => {
   try {
-    for (const [k, v] of Object.entries({ JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY, GITHUB_TOKEN })) {
+    for (const [k, v] of Object.entries({ JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY })) {
       if (!v) throw new Error(`Missing required env: ${k}`);
+    }
+    if (!MODELS_TOKEN && USE_LLM === 'true') {
+      throw new Error('Missing required env: GH_MODELS_TOKEN or GITHUB_TOKEN');
     }
     pickMode();
 
@@ -346,10 +325,6 @@ function fallbackTicket(ctx) {
 
     let gen;
     if (USE_LLM === 'true') {
-      if (!PREFERRED_MODEL) {
-        console.error('Missing PREFERRED_MODEL.');
-        process.exit(1);
-      }
       try {
         gen = await generateWithGitHubModels({
           repo: REPO,
@@ -360,23 +335,14 @@ function fallbackTicket(ctx) {
         });
       } catch (e) {
         console.error(`LLM request failed for preferred model: ${PREFERRED_MODEL}`);
-        if (e && (e.body || e.status)) {
-          if (e.status) console.error('Status:', e.status);
-          console.error('Response body:', JSON.stringify(e.body || {}, null, 2));
-        } else {
-          console.error('Error details:', e);
+        if (DEBUG === 'true') {
+          console.error('Status:', e.status || '');
+          console.error('Response body:', JSON.stringify(e.body || e, null, 2));
         }
-        console.error('Aborting ticket creation because the LLM could not be used with the preferred model.');
-        process.exit(1);
+        throw new Error('Aborting ticket creation because the LLM could not be used with the preferred model.');
       }
     } else {
-      gen = fallbackTicket({
-        repo: REPO,
-        prUrl: PR_HTML_URL || '',
-        prTitle: PR_TITLE || '',
-        prBody: PR_BODY || '',
-        upgrades
-      });
+      throw new Error('Aborting ticket creation because USE_LLM=false is not supported for this workflow.');
     }
 
     const defaults = (JIRA_DEFAULT_LABELS || '').split(',').map(s => s.trim()).filter(Boolean);
