@@ -3,27 +3,47 @@ name: Dependabot → Jira Bug
 on:
   pull_request:
     types: [opened, reopened, synchronize, edited]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
   pull-requests: write
-  models: read
+  models: read   # lets GITHUB_TOKEN call models.github.ai
 
 jobs:
   create-jira-bug:
     runs-on: ubuntu-latest
+    env:
+      # ---- Jira (Site API mode) ----
+      JIRA_API_BASE: ${{ secrets.JIRA_API_BASE }}
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
+      JIRA_BROWSE_BASE: ${{ secrets.JIRA_BROWSE_BASE }}
+      # (Optional) issue type / points:
+      JIRA_ISSUE_TYPE: Bug
+      JIRA_STORY_POINTS_FIELD_ID: ""
+      JIRA_STORY_POINTS_VALUE: ""
+
+      # ---- LLM config ----
+      USE_LLM: "true"
+      # Set to a model you actually have access to (from your repo “Models” tab)
+      # If your tab shows openai/gpt-5-nano, use that value exactly:
+      PREFERRED_MODEL: "openai/gpt-5-nano"
+      GH_MODELS_TOKEN: ${{ github.token }} # built-in token
+
+      DEBUG: "true"
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Jira auth check (EX or Site)
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # ---- Preflight: Jira auth check (your current shell snippet) ----
+      - name: Jira auth check
         shell: bash
-        env:
-          JIRA_EX_BASE: ${{ vars.JIRA_EX_BASE }}
-          JIRA_CLOUD_ID: ${{ vars.JIRA_CLOUD_ID }}
-          JIRA_API_BASE: ${{ vars.JIRA_API_BASE }}
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
         run: |
           set -euo pipefail
           if [[ -n "${JIRA_EX_BASE:-}" && -n "${JIRA_CLOUD_ID:-}" ]]; then
@@ -48,43 +68,20 @@ jobs:
           fi
           echo "OK: Token + scopes valid"
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Create Jira ticket from Dependabot PR
-        id: create-jira
-        env:
-          DEBUG: "true"
-          USE_LLM: ${{ vars.USE_LLM }}                # e.g. true
-          PREFERRED_MODEL: ${{ vars.PREFERRED_MODEL }} # e.g. openai/gpt-5-nano or your model id
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-          JIRA_EX_BASE: ${{ vars.JIRA_EX_BASE }}
-          JIRA_CLOUD_ID: ${{ vars.JIRA_CLOUD_ID }}
-          JIRA_API_BASE: ${{ vars.JIRA_API_BASE }}
-
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          JIRA_PROJECT_KEY: ${{ vars.JIRA_PROJECT_KEY }}
-          JIRA_ISSUE_TYPE: ${{ vars.JIRA_ISSUE_TYPE }}
-          JIRA_DEFAULT_LABELS: ${{ vars.JIRA_DEFAULT_LABELS }}
-          JIRA_STORY_POINTS_FIELD_ID: ${{ vars.JIRA_STORY_POINTS_FIELD_ID }}
-          JIRA_STORY_POINTS_VALUE: ${{ vars.JIRA_STORY_POINTS_VALUE }}
-          JIRA_BROWSE_BASE: ${{ vars.JIRA_BROWSE_BASE }}
-
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-          PR_HTML_URL: ${{ github.event.pull_request.html_url }}
-          REPO: ${{ github.repository }}
+      # ---- Run your Node script ----
+      - name: Create Jira bug from Dependabot PR
         run: node .github/workflows/scripts/create-jira-ticket-from-dependabot.ex.cjs
 
+      # (Optional) comment back on PR using outputs you set in the script)
       - name: Comment PR with Jira link
-        if: ${{ success() && steps.create-jira.outputs.jira_key != '' }}
+        if: always()
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          gh pr comment ${{ github.event.pull_request.number }} \
-            --body "Jira bug created: **${{ steps.create-jira.outputs.jira_key }}** – ${{ steps.create-jira.outputs.jira_url }}"
+          if [[ -f "$GITHUB_OUTPUT" ]]; then
+            key=$(grep '^jira_key=' "$GITHUB_OUTPUT" | cut -d= -f2- || true)
+            url=$(grep '^jira_url=' "$GITHUB_OUTPUT" | cut -d= -f2- || true)
+            if [[ -n "$key" && -n "$url" ]]; then
+              gh pr comment "${{ github.event.pull_request.number }}" --body "Jira bug created: **${key}** – ${url}"
+            fi
+          fi
