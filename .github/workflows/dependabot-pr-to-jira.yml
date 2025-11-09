@@ -1,0 +1,94 @@
+name: Dependabot PR to Jira Bug
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+    branches: ["**"]
+
+jobs:
+  create-jira-bug:
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Preflight Jira auth/scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${JIRA_EX_BASE:-}" && -n "${JIRA_CLOUD_ID:-}" ]]; then
+            host=$(node -e "console.log(new URL(process.env.JIRA_EX_BASE).hostname)")
+            path="/ex/jira/${JIRA_CLOUD_ID}/rest/api/3/myself"
+          elif [[ -n "${JIRA_API_BASE:-}" ]]; then
+            host=$(node -e "console.log(new URL(process.env.JIRA_API_BASE).hostname)")
+            path="/rest/api/3/myself"
+          else
+            echo "::error::Missing Jira config (EX or Site)."
+            exit 1
+          fi
+          code=$(curl -sS -o resp.json -w "%{http_code}" \
+            -H "Accept: application/json" \
+            -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+            "https://${host}${path}")
+          echo "HTTP ${code}"
+          if [ "$code" -ne 200 ]; then
+            echo "::error title=Jira auth/scope failed::See response below"
+            cat resp.json
+            exit 1
+          fi
+          echo "OK: Token + scopes valid"
+        env:
+          JIRA_EX_BASE: ${{ secrets.JIRA_EX_BASE }}
+          JIRA_CLOUD_ID: ${{ secrets.JIRA_CLOUD_ID }}
+          JIRA_API_BASE: ${{ secrets.JIRA_API_BASE }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+
+      - name: Generate ticket & create in Jira
+        id: jira
+        env:
+          DEBUG: ${{ secrets.DEBUG }}
+          USE_LLM: 'true'
+          PREFERRED_MODEL: ${{ secrets.PREFERRED_MODEL }}
+          GH_MODELS_TOKEN: ${{ github.token }}
+
+          # Jira (EX or Site)
+          JIRA_EX_BASE: ${{ secrets.JIRA_EX_BASE }}
+          JIRA_CLOUD_ID: ${{ secrets.JIRA_CLOUD_ID }}
+          JIRA_API_BASE: ${{ secrets.JIRA_API_BASE }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
+          JIRA_ISSUE_TYPE: ${{ secrets.JIRA_ISSUE_TYPE }}
+          JIRA_DEFAULT_LABELS: ${{ secrets.JIRA_DEFAULT_LABELS }}
+          JIRA_STORY_POINTS_FIELD_ID: ${{ secrets.JIRA_STORY_POINTS_FIELD_ID }}
+          JIRA_STORY_POINTS_VALUE: ${{ secrets.JIRA_STORY_POINTS_VALUE }}
+          JIRA_BROWSE_BASE: ${{ secrets.JIRA_BROWSE_BASE }}
+
+          # PR context
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_HTML_URL: ${{ github.event.pull_request.html_url }}
+          REPO: ${{ github.repository }}
+        run: node .github/workflows/scripts/create-jira-ticket-from-dependabot.ex.cjs
+
+      - name: Comment back on PR with Jira issue
+        if: steps.jira.outputs.jira_key != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} --body "Jira bug created: **${{ steps.jira.outputs.jira_key }}** – ${{ steps.jira.outputs.jira_url }}"
