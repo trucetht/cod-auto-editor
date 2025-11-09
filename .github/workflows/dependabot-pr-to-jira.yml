@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   create-jira-bug:
-    # Run if this is a Dependabot PR (author or branch) OR when manually dispatched
+    # Run on Dependabot PRs (by author or branch) OR manual dispatch
     if: >
       (github.event_name == 'workflow_dispatch')
       || (
@@ -40,8 +40,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-
-      # You don't use the OpenAI SDK in your script anymore, so skip installing it.
 
       - name: Jira auth check (site mode)
         shell: bash
@@ -71,6 +69,7 @@ jobs:
 
       - name: Create Jira ticket from Dependabot PR (site mode)
         env:
+          # Jira (site mode)
           JIRA_API_BASE: ${{ secrets.JIRA_API_BASE }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
@@ -80,10 +79,14 @@ jobs:
           JIRA_STORY_POINTS_FIELD_ID: ${{ secrets.JIRA_STORY_POINTS_FIELD_ID }}
           JIRA_STORY_POINTS_VALUE: ${{ secrets.JIRA_STORY_POINTS_VALUE }}
 
+          # LLM config
           USE_LLM: 'true'
+          # Optional: set a repo variable to override (e.g., openai/gpt-5-nano or openai/gpt-5-mini)
           PREFERRED_MODEL: ${{ vars.PREFERRED_MODEL }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # IMPORTANT: use the built-in token, not secrets.GITHUB_TOKEN
+          GITHUB_TOKEN: ${{ github.token }}
 
+          # PR context
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
