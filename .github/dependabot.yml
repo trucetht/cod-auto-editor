@@ -5,32 +5,52 @@
 
 version: 2
 updates:
-  # Python deps (pip / setuptools with PEP 621 in pyproject.toml)
+  # Python deps (covers pyproject.toml + requirements*.txt in /)
   - package-ecosystem: "pip"
-    directory: "/"                  # where pyproject.toml is
+    directory: "/"                 # root: scans pyproject.toml + requirements*.txt here
     schedule:
-      interval: "weekly"            # or daily/monthly
+      interval: "weekly"           # daily|weekly|monthly
       day: "monday"
       time: "09:00"
       timezone: "America/New_York"
-    allow:
-      - dependency-type: "direct"   # only bump your top-level deps
-    versioning-strategy: increase-if-necessary
     open-pull-requests-limit: 10
+    versioning-strategy: increase-if-necessary
     commit-message:
-      prefix: "deps"
+      prefix: "deps(pip)"
       include: "scope"
     labels: ["dependencies", "python"]
-    reviewers: ["trucetht"]         # or your team slug
-    assignees: ["trucetht"]
+    # Optional: group related updates into fewer PRs
+    groups:
+      runtime:
+        applies-to: version-updates
+        patterns:
+          - "moviepy"
+          - "opencv-python"
+          - "numpy"
+          - "PyYAML"
+          - "torch"
+          - "faster-whisper"
+          - "psycopg2-binary"
+          - "sentence-transformers"
+          - "stable-ts"
+          - "PyQt5*"
+      tooling:
+        applies-to: version-updates
+        patterns:
+          - "build"
+          - "wheel"
+          - "setuptools"
+    # Optional: pin or defer noisy majors
+    ignore:
+      - dependency-name: "torch"
+        update-types: ["version-update:semver-major"]
 
-  # GitHub Actions updates
+  # Keep your GitHub Actions runners fresh, too
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
-      day: "monday"
-      time: "09:15"
-      timezone: "America/New_York"
-    labels: ["dependencies", "ci"]
+    commit-message:
+      prefix: "deps(actions)"
+
 
