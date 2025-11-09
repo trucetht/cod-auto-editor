@@ -50,7 +50,7 @@ const {
   GITHUB_TOKEN,
 
   USE_LLM = 'true',
-  PREFERRED_MODEL = 'gpt-5-mini'
+  PREFERRED_MODEL = 'openai/gpt-5-nano'
 } = process.env;
 
 const MODELS_TOKEN = GH_MODELS_TOKEN || GITHUB_TOKEN;
