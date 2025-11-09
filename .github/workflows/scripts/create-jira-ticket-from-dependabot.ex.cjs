@@ -14,14 +14,21 @@
 
 const https = require('https');
 const fs = require('fs');
-const OpenAI = require('openai');
 
 const {
   DEBUG,
-  JIRA_EX_BASE,
+
+  // EX gateway
+  JIRA_EX_BASE,     // e.g. https://api.atlassian.com/ex/jira
   JIRA_CLOUD_ID,
+
+  // Site API 
   JIRA_API_BASE,
+
+  // optional explicit mode override: "ex" or "site"
   JIRA_MODE,
+
+  // Common
   JIRA_EMAIL,
   JIRA_API_TOKEN,
   JIRA_PROJECT_KEY,
@@ -30,15 +37,24 @@ const {
   JIRA_STORY_POINTS_FIELD_ID = '',
   JIRA_STORY_POINTS_VALUE = '',
   JIRA_BROWSE_BASE,
+
+  // PR context
   PR_NUMBER,
   PR_TITLE,
   PR_BODY = '',
   PR_HTML_URL,
   REPO,
+
+  // GitHub Models
+  GH_MODELS_TOKEN,
+  GITHUB_TOKEN,
+
   USE_LLM = 'true',
-  PREFERRED_MODEL = 'openai/gpt-5-nano',
-  GITHUB_TOKEN
+  PREFERRED_MODEL = 'openai/gpt-5-nano'
 } = process.env;
+
+const MODELS_TOKEN = GH_MODELS_TOKEN || GITHUB_TOKEN;
+const REQUEST_TIMEOUT_MS = 20000;
 
 const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
 
@@ -58,7 +74,14 @@ function httpJson({ method, host, path, headers = {} }, body) {
         return reject(err);
       });
     });
-    req.on('error', reject);
+    req.on('error', (e) => {
+      const err = new Error(e.message || 'request_error');
+      err.code = e.code;
+      return reject(err);
+    });
+    req.setTimeout(REQUEST_TIMEOUT_MS, () => {
+      req.destroy(new Error('request_timeout'));
+    });
     if (body) req.write(typeof body === 'string' ? body : JSON.stringify(body));
     req.end();
   });
@@ -101,9 +124,11 @@ function jiraHostAndPathBuilder() {
 function extractPackages(prTitle, prBody) {
   const pkgs = new Set();
   const upgrades = [];
+
   const ver = '([0-9A-Za-z.+-]+)';
   const t = prTitle?.match(new RegExp(`Bump\\s+([@\\w\\/.-]+)\\s+from\\s+${ver}\\s+to\\s+${ver}`, 'i'));
   if (t) { pkgs.add(t[1]); upgrades.push({ name: t[1], from: t[2], to: t[3] }); }
+
   if (prBody) {
     const re = new RegExp(String.raw`(?<=\* )([@\w\/.-]+)\s+from\s+${ver}\s+to\s+${ver}`, 'gi');
     for (const m of prBody.matchAll(re)) {
@@ -124,13 +149,26 @@ function sanitizeLabel(s) {
 }
 
 async function generateWithGitHubModels(ctx) {
-  if (!GITHUB_TOKEN) throw new Error('Missing required env: GITHUB_TOKEN');
-  const client = new OpenAI({ baseURL: 'https://models.github.ai/inference', apiKey: GITHUB_TOKEN });
-  const response = await client.chat.completions.create({
+  if (!MODELS_TOKEN) {
+    const e = new Error('missing_token');
+    e.code = 'missing_token';
+    throw e;
+  }
+
+  const body = {
     model: PREFERRED_MODEL,
     messages: [
-      { role: 'system', content: 'You are a release/QA engineer. Produce crisp Jira BUG ticket content from dependency upgrade PRs.' },
-      { role: 'user', content:
+      {
+        role: "system",
+        content:
+          "You are a release/QA engineer. Produce crisp Jira BUG ticket content from dependency upgrade PRs."
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text:
 `Repo: ${ctx.repo}
 PR: ${ctx.prUrl}
 Title: ${ctx.prTitle}
@@ -139,17 +177,71 @@ Parsed upgrades:
 ${ctx.upgrades.map(u => `- ${u.name}: ${u.from} → ${u.to}`).join('\n')}
 
 PR body (truncated):
-${(ctx.prBody || '').slice(0, 3000)}
-
-Return STRICT JSON with keys: title, description, acceptance_criteria, definition_of_done, labels. Do not include markdown fences.` }
+${(ctx.prBody || '').slice(0, 3000)}`
+          },
+          {
+            type: "text",
+            text:
+`Return STRICT JSON:
+{
+  "title": string,                       
+  "description": string,                 
+  "acceptance_criteria": [string, ...],  
+  "definition_of_done": [string, ...],   
+  "labels": [string, ...]                
+}`
+          }
+        ]
+      }
     ]
-  });
-  const content = response.choices?.[0]?.message?.content;
-  if (!content) throw new Error('No content from models API');
+  };
+
+  let res;
+  try {
+    res = await httpJson(
+      {
+        method: 'POST',
+        host: 'models.github.ai',
+        path: '/inference/chat/completions',
+        headers: {
+          'User-Agent': 'gh-models-jira-bot',
+          'Authorization': `Bearer ${MODELS_TOKEN}`,
+          'Accept': 'application/json',
+          'X-GitHub-Api-Version': '2022-11-28',
+          'Content-Type': 'application/json'
+        }
+      },
+      body
+    );
+  } catch (err) {
+    throw err;
+  }
+
+  const content = res?.data?.choices?.[0]?.message?.content;
+  if (!content) {
+    const e = new Error('no_content_from_models_api');
+    e.status = res?.status;
+    e.body = res?.data;
+    throw e;
+  }
+
   const jsonMatch = content.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error('No JSON object found in model response');
+  if (!jsonMatch) {
+    const e = new Error('no_json_object_found_in_model_response');
+    e.status = res?.status;
+    e.body = { raw: content };
+    throw e;
+  }
+
   let parsed;
-  try { parsed = JSON.parse(jsonMatch[0]); } catch { throw new Error('Malformed JSON in model response'); }
+  try { parsed = JSON.parse(jsonMatch[0]); }
+  catch {
+    const e = new Error('malformed_json_in_model_response');
+    e.status = res?.status;
+    e.body = { raw: content };
+    throw e;
+  }
+
   validateModelResponseSchema(parsed);
   return parsed;
 }
@@ -173,6 +265,7 @@ function validateModelResponseSchema(obj) {
 function jiraClient() {
   const { mode, host, path } = jiraHostAndPathBuilder();
   const auth = `Basic ${b64(`${JIRA_EMAIL}:${JIRA_API_TOKEN}`)}`;
+
   return {
     mode,
     async get(p) {
@@ -193,9 +286,10 @@ async function jiraSearchByText(jira, text) {
   if (!text || !text.trim()) return null;
   const safe = text.replace(/["\\]/g, '\\$&');
   const jql = `project = ${JIRA_PROJECT_KEY} AND text ~ "${safe}" ORDER BY created DESC`;
-  const qs = `jql=${encodeURIComponent(jql)}&maxResults=1&fields=key`;
-  const res = await jira.get(`/search?${qs}`);
-  return res.data.issues?.[0] ?? null;
+  const body = { jql, startAt: 0, maxResults: 1, fields: ["key"] };
+  const res = await jira.post('/search', body);
+  const issue = res.data?.issues?.[0];
+  return issue ?? null;
 }
 
 async function jiraCreateIssue(jira, fields) {
@@ -220,11 +314,16 @@ function buildBrowseUrl(issueKey) {
 
 (async () => {
   try {
-    for (const [k, v] of Object.entries({ JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY, GITHUB_TOKEN })) {
+    for (const [k, v] of Object.entries({ JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY })) {
       if (!v) throw new Error(`Missing required env: ${k}`);
     }
+    if (USE_LLM === 'true' && !MODELS_TOKEN) {
+      throw new Error('Missing required env: GH_MODELS_TOKEN or GITHUB_TOKEN');
+    }
     pickMode();
+
     const jira = jiraClient();
+
     try {
       const me = await jira.get('/myself');
       if (DEBUG === 'true') console.log('Authenticated Jira user:', me.data && (me.data.displayName || me.data.name || 'ok'));
@@ -266,14 +365,15 @@ function buildBrowseUrl(issueKey) {
         });
       } catch (e) {
         console.error(`LLM request failed for preferred model: ${PREFERRED_MODEL}`);
-        if (e.status) console.error('Status:', e.status);
-        const body = e.body ? e.body : (e.response?.data || e.message || e);
-        try { console.error('Response body:', JSON.stringify(body, null, 2)); }
-        catch { console.error('Response body:', body); }
+        if (DEBUG === 'true') {
+          console.error('Status:', e.status || '');
+          if (e.code) console.error('Error code:', e.code);
+          console.error('Response body:', JSON.stringify(e.body || e, null, 2));
+        }
         throw new Error('Aborting ticket creation because the LLM could not be used with the preferred model.');
       }
     } else {
-      throw new Error('USE_LLM=false is not supported for this workflow.');
+      throw new Error('Aborting ticket creation because USE_LLM=false is not supported for this workflow.');
     }
 
     const defaults = (JIRA_DEFAULT_LABELS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -312,15 +412,18 @@ function buildBrowseUrl(issueKey) {
     const created = await jiraCreateIssue(jira, fields);
     const key = created.key;
     const browseUrl = buildBrowseUrl(key);
+
     setOutput('jira_key', key);
     setOutput('jira_url', browseUrl);
+
     console.log(`Created Jira issue ${key} -> ${browseUrl}`);
   } catch (err) {
     console.error('Failed to create Jira issue.');
     if (DEBUG === 'true') {
-      if (err && (err.body || err.status)) {
-        console.error('Status:', err.status);
-        console.error('Response body:', JSON.stringify(err.body, null, 2));
+      if (err && (err.body || err.status || err.code)) {
+        if (err.status) console.error('Status:', err.status);
+        if (err.code) console.error('Error code:', err.code);
+        console.error('Response body:', JSON.stringify(err.body || err, null, 2));
       } else {
         console.error('Error details:', err);
       }
